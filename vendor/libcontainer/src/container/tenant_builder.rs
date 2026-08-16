@@ -1,0 +1,917 @@
+use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::BufReader;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::str::FromStr;
+
+use caps::Capability;
+use nix::fcntl::OFlag;
+use nix::unistd::{Pid, pipe2, read};
+use oci_spec::runtime::{
+    Capabilities as SpecCapabilities, Capability as SpecCapability, LinuxBuilder,
+    LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxNamespace, LinuxNamespaceBuilder,
+    LinuxNamespaceType, Process, ProcessBuilder, Spec, UserBuilder,
+};
+use procfs::process::Namespace;
+
+use super::Container;
+use super::builder::ContainerBuilder;
+use super::mount_validation::validate_idmapped_mounts;
+use crate::capabilities::CapabilityExt;
+use crate::container::ContainerStatus;
+use crate::container::builder_impl::ContainerBuilderImpl;
+use crate::error::{ErrInvalidSpec, LibcontainerError, MissingSpecError};
+use crate::notify_socket::NotifySocket;
+use crate::process::args::ContainerType;
+use crate::syscall::syscall::create_syscall;
+use crate::user_ns::UserNamespaceConfig;
+use crate::validator::Validator;
+use crate::{tty, utils};
+
+const NAMESPACE_TYPES: &[&str] = &["ipc", "uts", "net", "pid", "mnt", "cgroup", "time"];
+const TENANT_NOTIFY: &str = "tenant-notify-";
+const TENANT_TTY: &str = "tenant-tty-";
+
+/// Builder that can be used to configure the properties of a process
+/// that will join an existing container sandbox
+pub struct TenantContainerBuilder {
+    base: ContainerBuilder,
+    env: HashMap<String, String>,
+    cwd: Option<PathBuf>,
+    args: Vec<String>,
+    no_new_privs: Option<bool>,
+    capabilities: Vec<String>,
+    process: Option<PathBuf>,
+    detached: bool,
+    as_sibling: bool,
+    additional_gids: Vec<u32>,
+    user: Option<u32>,
+    group: Option<u32>,
+    ignore_paused: bool,
+    sub_cgroup: Option<String>,
+    process_label: Option<String>,
+    apparmor: Option<String>,
+}
+
+/// This is a helper function to get capabilities for tenant container, based on
+/// additional capabilities provided by user and capabilities of existing container
+/// extracted into separate function for easier testing
+fn get_capabilities(
+    additional: &[String],
+    spec: &Spec,
+) -> Result<LinuxCapabilities, LibcontainerError> {
+    let mut caps: Vec<Capability> = Vec::with_capacity(additional.len());
+    for cap in additional {
+        caps.push(Capability::from_str(cap)?);
+    }
+    let caps: SpecCapabilities = caps.iter().map(|c| SpecCapability::from_cap(*c)).collect();
+
+    if let Some(spec_caps) = spec
+        .process()
+        .as_ref()
+        .ok_or(MissingSpecError::Process)?
+        .capabilities()
+    {
+        let mut capabilities_builder = LinuxCapabilitiesBuilder::default();
+
+        let bounding: SpecCapabilities = match spec_caps.bounding() {
+            Some(bounding) => bounding.union(&caps).copied().collect(),
+            None => SpecCapabilities::new().union(&caps).copied().collect(),
+        };
+        capabilities_builder = capabilities_builder.bounding(bounding);
+
+        let effective: SpecCapabilities = match spec_caps.effective() {
+            Some(effective) => effective.union(&caps).copied().collect(),
+            None => SpecCapabilities::new().union(&caps).copied().collect(),
+        };
+        capabilities_builder = capabilities_builder.effective(effective);
+
+        let permitted: SpecCapabilities = match spec_caps.permitted() {
+            Some(permitted) => permitted.union(&caps).copied().collect(),
+            None => SpecCapabilities::new().union(&caps).copied().collect(),
+        };
+        capabilities_builder = capabilities_builder.permitted(permitted);
+
+        // ambient capabilities are only useful when inherent capabilities
+        // are set. Hence we check and set accordingly. Inherent capabilities
+        // are never set from user as that can lead to vulnerability like
+        // https://github.com/advisories/GHSA-f3fp-gc8g-vw66
+        // Hence, we follow runc's code and set things similarly.
+        let caps = if let Some(inheritable) = spec_caps.inheritable() {
+            let ambient: SpecCapabilities = match spec_caps.ambient() {
+                Some(ambient) => ambient.union(&caps).copied().collect(),
+                None => SpecCapabilities::new().union(&caps).copied().collect(),
+            };
+            capabilities_builder = capabilities_builder.ambient(ambient);
+            capabilities_builder = capabilities_builder.inheritable(inheritable.clone());
+            capabilities_builder.build()?
+        } else {
+            let mut caps = capabilities_builder.build()?;
+            // oci-spec-rs sets these to some default caps, so we reset them here
+            caps.set_inheritable(None);
+            caps.set_ambient(None);
+            caps
+        };
+
+        return Ok(caps);
+    }
+
+    // If there are no caps in original container's spec,
+    // we simply set given caps , excluding the inherent and ambient
+    let mut caps = LinuxCapabilitiesBuilder::default()
+        .bounding(caps.clone())
+        .effective(caps.clone())
+        .permitted(caps.clone())
+        .build()?;
+    caps.set_inheritable(None);
+    caps.set_ambient(None);
+    Ok(caps)
+}
+
+impl TenantContainerBuilder {
+    /// Generates the base configuration for a process that will join
+    /// an existing container sandbox from which configuration methods
+    /// can be chained
+    pub(super) fn new(builder: ContainerBuilder) -> Self {
+        Self {
+            base: builder,
+            env: HashMap::new(),
+            cwd: None,
+            args: Vec::new(),
+            no_new_privs: None,
+            capabilities: Vec::new(),
+            process: None,
+            detached: false,
+            as_sibling: false,
+            additional_gids: vec![],
+            user: None,
+            group: None,
+            ignore_paused: false,
+            sub_cgroup: None,
+            process_label: None,
+            apparmor: None,
+        }
+    }
+
+    /// Sets environment variables for the container
+    pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Sets the working directory of the container
+    pub fn with_cwd<P: Into<PathBuf>>(mut self, path: Option<P>) -> Self {
+        self.cwd = path.map(|p| p.into());
+        self
+    }
+
+    /// Sets the command the container will be started with
+    pub fn with_container_args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
+        self
+    }
+
+    pub fn with_no_new_privs(mut self, no_new_privs: bool) -> Self {
+        self.no_new_privs = Some(no_new_privs);
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: Vec<String>) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_process<P: Into<PathBuf>>(mut self, path: Option<P>) -> Self {
+        self.process = path.map(|p| p.into());
+        self
+    }
+
+    /// Sets if the init process should be run as a child or a sibling of
+    /// the calling process
+    pub fn as_sibling(mut self, as_sibling: bool) -> Self {
+        self.as_sibling = as_sibling;
+        self
+    }
+
+    pub fn with_detach(mut self, detached: bool) -> Self {
+        self.detached = detached;
+        self
+    }
+
+    pub fn with_additional_gids(mut self, gids: Vec<u32>) -> Self {
+        self.additional_gids = gids;
+        self
+    }
+
+    pub fn with_user(mut self, user: Option<u32>) -> Self {
+        self.user = user;
+        self
+    }
+
+    pub fn with_group(mut self, group: Option<u32>) -> Self {
+        self.group = group;
+        self
+    }
+
+    pub fn with_ignore_paused(mut self, ignore_paused: bool) -> Self {
+        self.ignore_paused = ignore_paused;
+        self
+    }
+
+    pub fn with_sub_cgroup(mut self, sub_cgroup: Option<String>) -> Self {
+        self.sub_cgroup = sub_cgroup;
+        self
+    }
+
+    pub fn with_process_label(mut self, process_label: Option<String>) -> Self {
+        self.process_label = process_label;
+        self
+    }
+
+    pub fn with_apparmor(mut self, apparmor: Option<String>) -> Self {
+        self.apparmor = apparmor;
+        self
+    }
+
+    /// Joins an existing container
+    pub fn build(self) -> Result<Pid, LibcontainerError> {
+        let container_dir = self.lookup_container_dir()?;
+        let container = self.load_container_state(container_dir.clone())?;
+        let mut spec = self.load_init_spec(&container)?;
+        self.adapt_spec_for_tenant(&mut spec, &container)?;
+        // validate terminal field against console socket presence before any side effects
+        self.base.check_terminal(&spec, self.detached)?;
+
+        tracing::debug!("{:#?}", spec);
+
+        let notify_path = Self::setup_notify_listener(&container_dir)?;
+        // convert path of root file system of the container to absolute path
+        let rootfs = fs::canonicalize(spec.root().as_ref().ok_or(MissingSpecError::Root)?.path())
+            .map_err(LibcontainerError::OtherIO)?;
+
+        // if socket file path is given in commandline options,
+        // get file descriptors of console socket
+        let csocketfd = self.setup_tty_socket(&container_dir)?;
+
+        let use_systemd = self.should_use_systemd(&container);
+        let user_ns_config = UserNamespaceConfig::new(&spec)?;
+
+        let (read_end, write_end) =
+            pipe2(OFlag::O_CLOEXEC).map_err(LibcontainerError::OtherSyscall)?;
+
+        let mut builder_impl = ContainerBuilderImpl {
+            container_type: ContainerType::TenantContainer {
+                exec_notify_fd: write_end.as_raw_fd(),
+            },
+            syscall: self.base.syscall,
+            container_id: self.base.container_id,
+            pid_file: self.base.pid_file,
+            console_socket: csocketfd,
+            use_systemd,
+            cgroups_disabled: container.cgroups_disabled(),
+            spec: Rc::new(spec),
+            rootfs,
+            canonicalize_rootfs: false,
+            user_ns_config,
+            notify_path: notify_path.clone(),
+            container: None,
+            preserve_fds: self.base.preserve_fds,
+            detached: self.detached,
+            executor: self.base.executor,
+            no_pivot: false,
+            stdin: self.base.stdin,
+            stdout: self.base.stdout,
+            stderr: self.base.stderr,
+            error_fd: self.base.error_fd,
+            as_sibling: self.as_sibling,
+            sub_cgroup_path: self.sub_cgroup,
+            process_label: self.process_label,
+        };
+
+        let pid = builder_impl.create()?;
+
+        let mut notify_socket = NotifySocket::new(notify_path);
+        notify_socket.notify_container_start()?;
+
+        // Explicitly close the write end of the pipe here to notify the
+        // `read_end` that the init process is able to move forward. Closing one
+        // end of the pipe will immediately signal the other end of the pipe,
+        // which we use in the init thread as a form of barrier.  `drop` is used
+        // here because `OwnedFd` supports it, so we don't have to use `close`
+        // here with `RawFd`.
+        drop(write_end);
+
+        let mut err_str_buf = Vec::new();
+
+        loop {
+            let mut buf = [0; 3];
+            match read(read_end.as_raw_fd(), &mut buf).map_err(LibcontainerError::OtherSyscall)? {
+                0 => {
+                    if err_str_buf.is_empty() {
+                        return Ok(pid);
+                    } else {
+                        return Err(LibcontainerError::Other(
+                            String::from_utf8_lossy(&err_str_buf).to_string(),
+                        ));
+                    }
+                }
+                _ => {
+                    err_str_buf.extend(buf);
+                }
+            }
+        }
+    }
+
+    fn lookup_container_dir(&self) -> Result<PathBuf, LibcontainerError> {
+        let container_dir = self.base.root_path.join(&self.base.container_id);
+        if !container_dir.exists() {
+            tracing::error!(?container_dir, ?self.base.container_id, "container dir does not exist");
+            return Err(LibcontainerError::NoDirectory);
+        }
+
+        Ok(container_dir)
+    }
+
+    fn load_init_spec(&self, container: &Container) -> Result<Spec, LibcontainerError> {
+        let spec_path = container.bundle().join("config.json");
+
+        let mut spec = Spec::load(&spec_path).map_err(|err| {
+            tracing::error!(path = ?spec_path, ?err, "failed to load spec");
+            err
+        })?;
+
+        Self::validate_spec(&spec)?;
+
+        spec.canonicalize_rootfs(container.bundle())?;
+        Ok(spec)
+    }
+
+    fn validate_spec(spec: &Spec) -> Result<(), LibcontainerError> {
+        let version = spec.version();
+        if !version.starts_with("1.") {
+            tracing::error!(
+                "runtime spec has incompatible version '{}'. Only 1.X.Y is supported",
+                spec.version()
+            );
+            Err(ErrInvalidSpec::UnsupportedVersion)?;
+        }
+
+        Validator::validate_spec(spec)?;
+
+        let syscall = create_syscall();
+
+        if let Some(mounts) = spec.mounts() {
+            utils::validate_mount_options(mounts)?;
+            validate_idmapped_mounts(mounts, spec.linux().as_ref(), &*syscall)?;
+        }
+
+        utils::validate_spec_for_new_user_ns(spec, &*syscall)?;
+        utils::validate_spec_for_net_devices(spec, &*syscall)
+            .map_err(LibcontainerError::NetDevicesError)?;
+
+        Ok(())
+    }
+
+    fn load_container_state(&self, container_dir: PathBuf) -> Result<Container, LibcontainerError> {
+        let container = Container::load(container_dir)?;
+
+        match container.status() {
+            ContainerStatus::Running => Ok(container),
+            ContainerStatus::Paused if self.ignore_paused => Ok(container),
+            _ => {
+                tracing::error!(status = ?container.status(), "cannot exec: invalid container state");
+                Err(LibcontainerError::IncorrectStatus(container.status()))
+            }
+        }
+    }
+
+    fn adapt_spec_for_tenant(
+        &self,
+        spec: &mut Spec,
+        container: &Container,
+    ) -> Result<(), LibcontainerError> {
+        let process = if let Some(process) = &self.process {
+            self.get_process(process)?
+        } else {
+            // Use the spec's process env as the baseline for exec.
+            let spec_env = spec
+                .process()
+                .as_ref()
+                .and_then(|p| p.env().as_ref().cloned())
+                .unwrap_or_default();
+            let mut process_builder = ProcessBuilder::default()
+                .args(self.get_args()?)
+                .env(self.get_environment(spec_env));
+            if let Some(cwd) = self.get_working_dir()? {
+                process_builder = process_builder.cwd(cwd);
+            }
+
+            if let Some(process) = spec.process() {
+                if let Some(cpu_affinity) = process.exec_cpu_affinity() {
+                    process_builder = process_builder.exec_cpu_affinity(cpu_affinity.clone());
+                }
+            }
+
+            if let Some(no_new_priv) = self.get_no_new_privileges(spec) {
+                process_builder = process_builder.no_new_privileges(no_new_priv);
+            }
+
+            if let Some(ref apparmor) = self.apparmor {
+                process_builder = process_builder.apparmor_profile(apparmor)
+            }
+
+            let capabilities = get_capabilities(&self.capabilities, spec)?;
+            process_builder = process_builder.capabilities(capabilities);
+
+            let mut user_builder = UserBuilder::default();
+
+            if !self.additional_gids.is_empty() {
+                user_builder = user_builder.additional_gids(self.additional_gids.clone());
+            }
+
+            if let Some(uid) = self.user {
+                user_builder = user_builder.uid(uid);
+            }
+
+            if let Some(gid) = self.group {
+                user_builder = user_builder.gid(gid);
+            }
+
+            process_builder = process_builder.user(user_builder.build()?);
+
+            process_builder.build()?
+        };
+
+        let container_pid = container.pid().ok_or(LibcontainerError::Other(
+            "could not retrieve container init pid".into(),
+        ))?;
+
+        let init_process = procfs::process::Process::new(container_pid.as_raw())?;
+        let spec_namespaces = spec
+            .linux()
+            .as_ref()
+            .and_then(|l| l.namespaces().as_deref());
+        let ns = self.get_namespaces(init_process.namespaces()?.0, spec_namespaces)?;
+
+        // it should never be the case that linux is not present in spec
+        let spec_linux = spec.linux().as_ref().unwrap();
+        let mut linux_builder = LinuxBuilder::default().namespaces(ns);
+
+        if let Some(cgroup_path) = spec_linux.cgroups_path() {
+            linux_builder = linux_builder.cgroups_path(cgroup_path.clone());
+        }
+
+        if let Some(personality) = spec_linux.personality() {
+            linux_builder = linux_builder.personality(personality.clone());
+        }
+
+        if let Some(time_offsets) = spec_linux.time_offsets() {
+            linux_builder = linux_builder.time_offsets(time_offsets.clone());
+        }
+
+        let linux = linux_builder.build()?;
+        spec.set_process(Some(process)).set_linux(Some(linux));
+
+        Ok(())
+    }
+
+    fn get_process(&self, process: &Path) -> Result<Process, LibcontainerError> {
+        if !process.exists() {
+            tracing::error!(?process, "process.json file does not exist");
+            return Err(LibcontainerError::Other(
+                "process.json file does not exist".into(),
+            ));
+        }
+
+        let process = utils::open(process).map_err(LibcontainerError::OtherIO)?;
+        let reader = BufReader::new(process);
+        let process_spec =
+            serde_json::from_reader(reader).map_err(LibcontainerError::OtherSerialization)?;
+        Ok(process_spec)
+    }
+
+    fn get_working_dir(&self) -> Result<Option<PathBuf>, LibcontainerError> {
+        if let Some(cwd) = &self.cwd {
+            if cwd.is_relative() {
+                tracing::error!(?cwd, "current working directory must be an absolute path");
+                return Err(LibcontainerError::Other(
+                    "current working directory must be an absolute path".into(),
+                ));
+            }
+            return Ok(Some(cwd.into()));
+        }
+        Ok(None)
+    }
+
+    fn get_args(&self) -> Result<Vec<String>, LibcontainerError> {
+        if self.args.is_empty() {
+            Err(MissingSpecError::Args)?;
+        }
+
+        Ok(self.args.clone())
+    }
+
+    /// Builds the environment for an exec process.
+    /// The spec's env vars are used as the baseline, and env vars provided to the
+    /// builder, such as those from the CLI, override entries with the same key.
+    /// This follows runc's behavior.
+    /// See <https://github.com/youki-dev/youki/issues/3428>.
+    fn get_environment(&self, spec_env: Vec<String>) -> Vec<String> {
+        // Start with spec env, skipping any vars that the CLI overrides.
+        let mut env: Vec<String> = spec_env
+            .into_iter()
+            .filter(|entry| {
+                let key = entry.split('=').next().unwrap_or("");
+                !self.env.contains_key(key)
+            })
+            .collect();
+
+        // Append CLI overrides.
+        for (k, v) in &self.env {
+            env.push(format!("{k}={v}"));
+        }
+
+        env
+    }
+
+    fn get_no_new_privileges(&self, spec: &Spec) -> Option<bool> {
+        self.no_new_privs
+            .filter(|&is_set| is_set)
+            .or_else(|| spec.process().as_ref().and_then(|p| p.no_new_privileges()))
+    }
+
+    fn get_namespaces(
+        &self,
+        init_namespaces: HashMap<OsString, Namespace>,
+        spec_namespaces: Option<&[LinuxNamespace]>,
+    ) -> Result<Vec<LinuxNamespace>, LibcontainerError> {
+        let landlord_ns_types: HashSet<LinuxNamespaceType> = spec_namespaces
+            .map(|nss| nss.iter().map(|ns| ns.typ()).collect())
+            .unwrap_or_default();
+        let mut tenant_namespaces = Vec::with_capacity(init_namespaces.len());
+
+        for &ns_type in NAMESPACE_TYPES {
+            let tenant_ns = LinuxNamespaceType::try_from(ns_type)?;
+            // Skip namespaces that are not specified for the init process.
+            if !landlord_ns_types.contains(&tenant_ns) {
+                continue;
+            }
+            if let Some(init_ns) = init_namespaces.get(OsStr::new(ns_type)) {
+                tenant_namespaces.push(
+                    LinuxNamespaceBuilder::default()
+                        .typ(tenant_ns)
+                        .path(init_ns.path.clone())
+                        .build()?,
+                )
+            }
+        }
+
+        Ok(tenant_namespaces)
+    }
+
+    fn should_use_systemd(&self, container: &Container) -> bool {
+        container.systemd()
+    }
+
+    fn setup_notify_listener(container_dir: &Path) -> Result<PathBuf, LibcontainerError> {
+        let notify_name = Self::generate_name(container_dir, TENANT_NOTIFY);
+        let socket_path = container_dir.join(notify_name);
+
+        Ok(socket_path)
+    }
+
+    fn setup_tty_socket(&self, container_dir: &Path) -> Result<Option<OwnedFd>, LibcontainerError> {
+        let tty_name = Self::generate_name(container_dir, TENANT_TTY);
+        let csocketfd = if let Some(console_socket) = &self.base.console_socket {
+            Some(tty::setup_console_socket(
+                container_dir,
+                console_socket,
+                &tty_name,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(csocketfd)
+    }
+
+    fn generate_name(dir: &Path, prefix: &str) -> String {
+        loop {
+            let rand = fastrand::i32(..);
+            let name = format!("{prefix}{rand:x}.sock");
+            if !dir.join(&name).exists() {
+                return name;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use caps::Capability as Cap;
+    use oci_spec::runtime::{Capabilities, Capability as SpecCap, SpecBuilder};
+
+    use super::*;
+    use crate::capabilities::CapabilityExt;
+    use crate::syscall::syscall::SyscallType;
+
+    fn get_spec(caps: LinuxCapabilities) -> Spec {
+        SpecBuilder::default()
+            .process(
+                ProcessBuilder::default()
+                    .capabilities(caps)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    fn cap_to_string(caps: &[Cap]) -> Vec<String> {
+        caps.iter().map(|c| c.to_string()).collect()
+    }
+
+    fn caps_to_spec_set(caps: &[Cap]) -> Capabilities {
+        caps.iter().map(|c| SpecCap::from_cap(*c)).collect()
+    }
+
+    fn empty_caps() -> LinuxCapabilities {
+        let mut t = LinuxCapabilities::default();
+        t.set_effective(None)
+            .set_bounding(None)
+            .set_permitted(None)
+            .set_inheritable(None)
+            .set_ambient(None);
+        t
+    }
+
+    /// Helper to build a minimal TenantContainerBuilder with the given CLI env.
+    fn builder_with_env(env: &[(&str, &str)]) -> TenantContainerBuilder {
+        let base = ContainerBuilder::new("test".to_string(), SyscallType::default());
+        let env_map: HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        TenantContainerBuilder::new(base).with_env(env_map)
+    }
+
+    // --- capabilities tests ---
+
+    // if there are no existing capabilities, then tenant can only
+    // set effective, bounding and permitted caps ; not inheritable or ambient
+    #[test]
+    fn test_capabilities_no_existing() -> Result<(), LibcontainerError> {
+        let spec = get_spec(empty_caps());
+
+        let extra_caps = &[Cap::CAP_SYS_ADMIN, Cap::CAP_NET_ADMIN, Cap::CAP_AUDIT_READ];
+
+        let additional = cap_to_string(extra_caps);
+        let caps = get_capabilities(&additional, &spec)?;
+
+        let expected_caps = empty_caps()
+            .set_effective(Some(caps_to_spec_set(extra_caps)))
+            .set_bounding(Some(caps_to_spec_set(extra_caps)))
+            .set_permitted(Some(caps_to_spec_set(extra_caps)))
+            .clone();
+
+        assert_eq!(caps, expected_caps);
+        Ok(())
+    }
+
+    // If there are existing capabilities, but not inherent, then tenant should union
+    // existing and provided caps only for effective, bounding and permitted,
+    // inherent and ambient should be explicitly None
+    #[test]
+    fn test_capabilities_with_existing() -> Result<(), LibcontainerError> {
+        let existing_caps = &[Cap::CAP_SYS_ADMIN, Cap::CAP_BPF, Cap::CAP_MKNOD];
+
+        let existing = LinuxCapabilities::default()
+            .set_effective(Some(caps_to_spec_set(existing_caps)))
+            .set_bounding(Some(caps_to_spec_set(existing_caps)))
+            .set_permitted(Some(caps_to_spec_set(existing_caps)))
+            .set_inheritable(None)
+            .set_ambient(None)
+            .clone();
+
+        let spec = get_spec(existing);
+
+        let extra_caps = &[Cap::CAP_SYS_ADMIN, Cap::CAP_NET_ADMIN, Cap::CAP_AUDIT_READ];
+
+        let additional = cap_to_string(extra_caps);
+        let caps = get_capabilities(&additional, &spec)?;
+
+        let mut combined_caps = existing_caps.to_vec();
+        combined_caps.extend(extra_caps);
+        let expected_caps = empty_caps()
+            .set_effective(Some(caps_to_spec_set(&combined_caps)))
+            .set_bounding(Some(caps_to_spec_set(&combined_caps)))
+            .set_permitted(Some(caps_to_spec_set(&combined_caps)))
+            .clone();
+
+        assert_eq!(caps, expected_caps);
+        Ok(())
+    }
+
+    // we check that if inherent capabilities are present, ambient are set correctly
+    #[test]
+    fn test_capabilities_with_existing_inherent() -> Result<(), LibcontainerError> {
+        let existing_caps = &[Cap::CAP_SYS_ADMIN, Cap::CAP_BPF, Cap::CAP_MKNOD];
+        let extra_caps = &[Cap::CAP_SYS_ADMIN, Cap::CAP_NET_ADMIN, Cap::CAP_AUDIT_READ];
+
+        let mut combined_caps = existing_caps.to_vec();
+        combined_caps.extend(extra_caps);
+
+        // case 1 :  when inheritable are there, but no ambient
+
+        let existing = LinuxCapabilities::default()
+            .set_effective(Some(caps_to_spec_set(existing_caps)))
+            .set_bounding(Some(caps_to_spec_set(existing_caps)))
+            .set_permitted(Some(caps_to_spec_set(existing_caps)))
+            .set_inheritable(Some(caps_to_spec_set(existing_caps)))
+            .set_ambient(None)
+            .clone();
+        let spec = get_spec(existing);
+        let additional = cap_to_string(extra_caps);
+        let caps = get_capabilities(&additional, &spec)?;
+        let expected_caps = empty_caps()
+            .set_effective(Some(caps_to_spec_set(&combined_caps)))
+            .set_bounding(Some(caps_to_spec_set(&combined_caps)))
+            .set_permitted(Some(caps_to_spec_set(&combined_caps)))
+            // inheritable must not change
+            .set_inheritable(Some(caps_to_spec_set(existing_caps)))
+            // as there were no existing ambient, only extra will be set
+            .set_ambient(Some(caps_to_spec_set(extra_caps)))
+            .clone();
+        assert_eq!(caps, expected_caps);
+
+        // case 2 :  when inheritable and ambient both are present
+
+        let existing = LinuxCapabilities::default()
+            .set_effective(Some(caps_to_spec_set(existing_caps)))
+            .set_bounding(Some(caps_to_spec_set(existing_caps)))
+            .set_permitted(Some(caps_to_spec_set(existing_caps)))
+            .set_inheritable(Some(caps_to_spec_set(existing_caps)))
+            .set_ambient(Some(caps_to_spec_set(existing_caps)))
+            .clone();
+        let spec = get_spec(existing);
+        let additional = cap_to_string(extra_caps);
+        let caps = get_capabilities(&additional, &spec)?;
+        let expected_caps = empty_caps()
+            .set_effective(Some(caps_to_spec_set(&combined_caps)))
+            .set_bounding(Some(caps_to_spec_set(&combined_caps)))
+            .set_permitted(Some(caps_to_spec_set(&combined_caps)))
+            // inheritable must not change
+            .set_inheritable(Some(caps_to_spec_set(existing_caps)))
+            .set_ambient(Some(caps_to_spec_set(&combined_caps)))
+            .clone();
+        assert_eq!(caps, expected_caps);
+
+        Ok(())
+    }
+
+    // --- environment tests ---
+
+    #[test]
+    fn env_inherits_spec_vars() {
+        let b = builder_with_env(&[]);
+        let spec_env = vec!["PATH=/usr/bin".to_string(), "AAA=bbb".to_string()];
+        let result = b.get_environment(spec_env);
+        assert!(result.contains(&"PATH=/usr/bin".to_string()));
+        assert!(result.contains(&"AAA=bbb".to_string()));
+    }
+
+    #[test]
+    fn builder_env_overrides_spec() {
+        let b = builder_with_env(&[("AAA", "override")]);
+        let spec_env = vec!["PATH=/usr/bin".to_string(), "AAA=bbb".to_string()];
+        let result = b.get_environment(spec_env);
+        assert!(result.contains(&"PATH=/usr/bin".to_string()));
+        assert!(result.contains(&"AAA=override".to_string()));
+        assert!(!result.contains(&"AAA=bbb".to_string()));
+    }
+
+    #[test]
+    fn builder_env_adds_new_vars() {
+        let b = builder_with_env(&[("NEW_VAR", "hello")]);
+        let spec_env = vec!["PATH=/usr/bin".to_string()];
+        let result = b.get_environment(spec_env);
+        assert!(result.contains(&"PATH=/usr/bin".to_string()));
+        assert!(result.contains(&"NEW_VAR=hello".to_string()));
+    }
+
+    #[test]
+    fn empty_spec_env_uses_builder_env_only() {
+        let b = builder_with_env(&[("FOO", "bar")]);
+        let result = b.get_environment(Vec::new());
+        assert_eq!(result, vec!["FOO=bar".to_string()]);
+    }
+
+    #[test]
+    fn no_env_at_all() {
+        let b = builder_with_env(&[]);
+        let result = b.get_environment(Vec::new());
+        assert!(result.is_empty());
+    }
+
+    // --- namespaces tests ---
+    fn ns_entry(ns_type: &str, path: &str) -> (OsString, Namespace) {
+        (
+            OsString::from(ns_type),
+            Namespace {
+                ns_type: OsString::from(ns_type),
+                path: PathBuf::from(path),
+                identifier: 0,
+                device_id: 0,
+            },
+        )
+    }
+
+    fn init_ns() -> HashMap<OsString, Namespace> {
+        HashMap::from([
+            ns_entry("ipc", "/proc/1/ns/ipc"),
+            ns_entry("uts", "/proc/1/ns/uts"),
+            ns_entry("net", "/proc/1/ns/net"),
+            ns_entry("pid", "/proc/1/ns/pid"),
+            ns_entry("mnt", "/proc/1/ns/mnt"),
+            ns_entry("cgroup", "/proc/1/ns/cgroup"),
+        ])
+    }
+
+    fn spec_ns(typ: LinuxNamespaceType) -> LinuxNamespace {
+        LinuxNamespaceBuilder::default().typ(typ).build().unwrap()
+    }
+
+    fn want_ns(typ: LinuxNamespaceType, path: &str) -> LinuxNamespace {
+        LinuxNamespaceBuilder::default()
+            .typ(typ)
+            .path(PathBuf::from(path))
+            .build()
+            .unwrap()
+    }
+
+    fn tenant_builder() -> TenantContainerBuilder {
+        TenantContainerBuilder::new(ContainerBuilder::new(
+            "test".to_string(),
+            SyscallType::default(),
+        ))
+    }
+
+    #[test]
+    fn ns_all_declared_returned() -> Result<(), LibcontainerError> {
+        use LinuxNamespaceType::*;
+        let got = tenant_builder().get_namespaces(
+            init_ns(),
+            Some(&[
+                spec_ns(Ipc),
+                spec_ns(Uts),
+                spec_ns(Network),
+                spec_ns(Pid),
+                spec_ns(Mount),
+                spec_ns(Cgroup),
+            ]),
+        )?;
+        assert_eq!(
+            got,
+            vec![
+                want_ns(Ipc, "/proc/1/ns/ipc"),
+                want_ns(Uts, "/proc/1/ns/uts"),
+                want_ns(Network, "/proc/1/ns/net"),
+                want_ns(Pid, "/proc/1/ns/pid"),
+                want_ns(Mount, "/proc/1/ns/mnt"),
+                want_ns(Cgroup, "/proc/1/ns/cgroup"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ns_spec_subset_filters_init() -> Result<(), LibcontainerError> {
+        use LinuxNamespaceType::*;
+        let got =
+            tenant_builder().get_namespaces(init_ns(), Some(&[spec_ns(Ipc), spec_ns(Network)]))?;
+        assert_eq!(
+            got,
+            vec![
+                want_ns(Ipc, "/proc/1/ns/ipc"),
+                want_ns(Network, "/proc/1/ns/net"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ns_spec_entry_missing_from_init_is_skipped() -> Result<(), LibcontainerError> {
+        use LinuxNamespaceType::*;
+        let got = tenant_builder().get_namespaces(
+            HashMap::from([ns_entry("ipc", "/proc/1/ns/ipc")]),
+            Some(&[spec_ns(Ipc), spec_ns(Pid)]),
+        )?;
+        assert_eq!(got, vec![want_ns(Ipc, "/proc/1/ns/ipc")]);
+        Ok(())
+    }
+}

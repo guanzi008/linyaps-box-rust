@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+      - name: Check formatting
+        run: cargo +1.88.0 fmt --all -- --check
+      - name: Run Clippy
+        run: cargo +1.88.0 clippy --all-targets --locked -- -D warnings
+      - name: Run tests
+        run: cargo +1.88.0 test --all-targets --locked
+      - name: Run vendored libcontainer tests
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo +1.88.0 test --manifest-path vendor/libcontainer/Cargo.toml --no-default-features --features systemd,v1,v2 --locked --lib -- --test-threads=1
+      - name: Build release binary
+        run: cargo +1.88.0 build --release --locked
+      - name: Audit implementation language
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_sources=$(find . \
+            -type d \( -name '.git' -o -name 'target' \) -prune -o \
+            -type f \( \
+              -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o \
+              -name '*.m' -o -name '*.mm' -o -name '*.S' -o -name '*.s' -o \
+              -name '*.asm' -o -name '*.go' -o -name '*.py' -o -name '*.pyx' \
+            \) -print)
+          if [[ -n "$native_sources" ]]; then
+            printf 'non-Rust implementation sources found:\n%s\n' "$native_sources" >&2
+            exit 1
+          fi
+          dependency_tree=$(cargo +1.88.0 tree --target x86_64-unknown-linux-gnu -e normal,build --prefix none)
+          if grep -Eq '^(libseccomp|libseccomp-sys|openssl-sys|libgit2-sys|curl-sys|aws-lc-sys|ring) v' <<<"$dependency_tree"; then
+            printf 'native runtime dependency found:\n%s\n' "$dependency_tree" >&2
+            exit 1
+          fi

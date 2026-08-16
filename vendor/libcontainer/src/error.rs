@@ -1,0 +1,270 @@
+use crate::container::ContainerStatus;
+
+#[derive(Debug, thiserror::Error)]
+pub enum MissingSpecError {
+    #[error("missing process in spec")]
+    Process,
+    #[error("missing linux in spec")]
+    Linux,
+    #[error("missing args in the process spec")]
+    Args,
+    #[error("missing root in the spec")]
+    Root,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LibcontainerError {
+    #[error("failed operation due to incompatible container status: `{0}`")]
+    IncorrectStatus(ContainerStatus),
+    #[error("container already exists")]
+    Exist,
+    #[error("container state directory does not exist")]
+    NoDirectory,
+    #[error("invalid input")]
+    InvalidInput(String),
+    #[error("requires at least one executors")]
+    NoExecutors,
+    #[error("rootless container requires valid user namespace definition")]
+    NoUserNamespace,
+
+    // Invalid inputs
+    #[error(transparent)]
+    InvalidID(#[from] ErrInvalidID),
+    #[error(transparent)]
+    MissingSpec(#[from] MissingSpecError),
+    #[error(transparent)]
+    InvalidSpec(#[from] ErrInvalidSpec),
+
+    // Errors from submodules and other errors
+    #[error(transparent)]
+    Tty(#[from] crate::tty::TTYError),
+    #[error(transparent)]
+    UserNamespace(#[from] crate::user_ns::UserNamespaceError),
+    #[error(transparent)]
+    NotifyListener(#[from] crate::notify_socket::NotifyListenerError),
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Hook(#[from] crate::hooks::HookError),
+    #[error(transparent)]
+    State(#[from] crate::container::state::StateError),
+    #[error("oci spec error")]
+    Spec(#[from] oci_spec::OciSpecError),
+    #[error(transparent)]
+    MainProcess(#[from] crate::process::container_main_process::ProcessError),
+    #[error(transparent)]
+    Procfs(#[from] procfs::ProcError),
+    #[error(transparent)]
+    Capabilities(#[from] caps::errors::CapsError),
+    #[error(transparent)]
+    CgroupManager(#[from] libcgroups::common::AnyManagerError),
+    #[error(transparent)]
+    CgroupCreate(#[from] libcgroups::common::CreateCgroupSetupError),
+    #[error(transparent)]
+    CgroupGet(#[from] libcgroups::common::GetCgroupSetupError),
+    #[error[transparent]]
+    Checkpoint(#[from] crate::container::CheckpointError),
+    #[error[transparent]]
+    CreateContainerError(#[from] CreateContainerError),
+    #[error(transparent)]
+    NetDevicesError(#[from] crate::utils::NetDevicesError),
+    #[error(transparent)]
+    NetworkError(#[from] crate::network::NetworkError),
+    #[error(transparent)]
+    IntelRdt(#[from] crate::process::intel_rdt::IntelRdtError),
+    #[error(transparent)]
+    Syscall(#[from] crate::syscall::SyscallError),
+
+    // Catch all errors that are not covered by the above
+    #[error("syscall error")]
+    OtherSyscall(#[source] nix::Error),
+    #[error("io error")]
+    OtherIO(#[source] std::io::Error),
+    #[error("serialization error")]
+    OtherSerialization(#[source] serde_json::Error),
+    #[error("{0}")]
+    OtherCgroup(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl LibcontainerError {
+    pub fn compatibility_message(&self) -> Option<String> {
+        match self {
+            Self::CreateContainerError(error) => error.compatibility_message(),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ErrInvalidID {
+    #[error("container id can't be empty")]
+    Empty,
+    #[error("container id contains invalid characters: {0}")]
+    InvalidChars(char),
+    #[error("container id can't be used to represent a file name (such as . or ..)")]
+    FileName,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ErrInvalidSpec {
+    #[error("runtime spec has incompatible version. Only 1.X.Y is supported")]
+    UnsupportedVersion,
+    #[error("apparmor is specified but not enabled on this system")]
+    AppArmorNotEnabled,
+    #[error("invalid io priority or class.")]
+    IoPriority,
+    #[error("invalid scheduler config for process: {0}")]
+    Scheduler(String),
+    #[error("cannot allocate tty if youki will detach without setting console socket")]
+    ConsoleSocketRequired,
+    #[error("cannot use console socket if youki will not detach or allocate tty")]
+    InvalidConsoleSocket,
+    #[error("idmapped mount requires bind mount")]
+    MountIdmapNonBind,
+    #[error("idmapped mount requires uid/gid mappings or a usable user namespace")]
+    MountIdmapMissingMappings,
+    #[error("idmapped mount is not supported")]
+    MountIdmapUnsupported,
+    #[error("idmapped mounts are not supported in rootless containers")]
+    MountIdmapRootless,
+    #[error("invalid netns path: {0}")]
+    InvalidNetNsPath(String),
+    #[error("unable to set hostname without a private UTS namespace")]
+    HostnameWithoutUTS,
+    #[error("unable to set domainname without a private UTS namespace")]
+    DomainnameWithoutUTS,
+    #[error("user namespace mappings specified, but user namespace isn't enabled in the config")]
+    UserMappingsWithoutNamespace,
+    #[error("unable to restrict sys entries without a private MNT namespace")]
+    SysEntriesWithoutMntNamespace,
+    #[error("sysctl {0} is not allowed in the hosts ipc namespace")]
+    SysctlNotAllowedInHostIpc(String),
+    #[error("sysctl {0} not allowed in host network namespace")]
+    SysctlNotAllowedInHostNet(String),
+    #[error("sysctl {0} is not allowed as it conflicts with the OCI {1} field")]
+    SysctlConflictsWithOci(String, String),
+    #[error("setting ucounts without a user namespace not allowed: {0}")]
+    SysctlNotAllowedInHostUser(String),
+    #[error("sysctl {0} is not in a separate kernel namespace")]
+    SysctlNotInSeparateNamespace(String),
+    #[error("invalid intelRdt.closID (must not contain '.', '..', or '/')")]
+    InvalidIntelRdtClosId,
+    #[error("time namespace offsets specified, but time namespace isn't enabled in the config")]
+    TimeNamespace,
+    #[error(
+        "time namespace enabled, but both namespace path and time offsets specified -- you may only provide one"
+    )]
+    TimeOffsetsWithPath,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub struct CreateContainerError(
+    #[source] Box<LibcontainerError>,
+    Option<Box<LibcontainerError>>,
+);
+
+impl CreateContainerError {
+    pub(crate) fn new(
+        run_error: LibcontainerError,
+        cleanup_error: Option<LibcontainerError>,
+    ) -> Self {
+        Self(Box::new(run_error), cleanup_error.map(Box::new))
+    }
+
+    fn compatibility_message(&self) -> Option<String> {
+        match self.0.as_ref() {
+            LibcontainerError::Syscall(crate::syscall::SyscallError::Nix(errno)) => {
+                Some(format!("setrlimit: {}", errno_message(*errno as i32)))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn errno_message(errno: i32) -> String {
+    let pointer = unsafe { libc::strerror(errno) };
+    if pointer.is_null() {
+        return std::io::Error::from_raw_os_error(errno).to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+impl std::fmt::Display for CreateContainerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to create container: {}", self.0)?;
+        if let Some(cleanup_err) = &self.1 {
+            write!(f, ". error during cleanup: {}", cleanup_err)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use libcgroups::common::CreateCgroupSetupError;
+
+    use super::{CreateContainerError, ErrInvalidID};
+
+    #[test]
+    fn test_create_container() {
+        let create_container_err =
+            CreateContainerError::new(CreateCgroupSetupError::NonDefault.into(), None);
+        let msg = format!("{}", create_container_err);
+        assert_eq!(
+            "failed to create container: non default cgroup root not supported",
+            msg
+        );
+
+        let create_container_err = CreateContainerError::new(
+            CreateCgroupSetupError::NonDefault.into(),
+            Some(ErrInvalidID::Empty.into()),
+        );
+        let msg = format!("{}", create_container_err);
+        assert_eq!(
+            "failed to create container: non default cgroup root not supported. \
+         error during cleanup: container id can't be empty",
+            msg
+        );
+
+        let create_container_err = CreateContainerError::new(
+            super::LibcontainerError::Syscall(crate::syscall::SyscallError::Nix(
+                nix::errno::Errno::EINVAL,
+            )),
+            None,
+        );
+        assert_eq!(
+            create_container_err.compatibility_message().as_deref(),
+            Some("setrlimit: Invalid argument")
+        );
+    }
+    #[test]
+    fn test_libcontainer_error_msg() {
+        use crate::container::ContainerStatus::*;
+        use crate::error::LibcontainerError::IncorrectStatus;
+
+        assert_eq!(
+            "failed operation due to incompatible container status: `Creating`",
+            format!("{}", IncorrectStatus(Creating))
+        );
+        assert_eq!(
+            "failed operation due to incompatible container status: `Created`",
+            format!("{}", IncorrectStatus(Created))
+        );
+        assert_eq!(
+            "failed operation due to incompatible container status: `Stopped`",
+            format!("{}", IncorrectStatus(Stopped))
+        );
+        assert_eq!(
+            "failed operation due to incompatible container status: `Running`",
+            format!("{}", IncorrectStatus(Running))
+        );
+        assert_eq!(
+            "failed operation due to incompatible container status: `Paused`",
+            format!("{}", IncorrectStatus(Paused))
+        );
+    }
+}

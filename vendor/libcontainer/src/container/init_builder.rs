@@ -1,0 +1,272 @@
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use oci_spec::runtime::Spec;
+use user_ns::UserNamespaceConfig;
+
+use super::builder::ContainerBuilder;
+use super::builder_impl::ContainerBuilderImpl;
+use super::mount_validation::validate_idmapped_mounts;
+use super::{Container, ContainerStatus};
+use crate::config::YoukiConfig;
+use crate::error::{ErrInvalidSpec, LibcontainerError, MissingSpecError};
+use crate::notify_socket::NOTIFY_FILE;
+use crate::process::args::ContainerType;
+use crate::syscall::syscall::create_syscall;
+use crate::validator::Validator;
+use crate::{apparmor, tty, user_ns, utils};
+
+// Builder that can be used to configure the properties of a new container
+pub struct InitContainerBuilder {
+    base: ContainerBuilder,
+    bundle: PathBuf,
+    use_systemd: bool,
+    cgroups_disabled: bool,
+    detached: bool,
+    no_pivot: bool,
+    canonicalize_rootfs: bool,
+    as_sibling: bool,
+}
+
+impl InitContainerBuilder {
+    /// Generates the base configuration for a new container from which
+    /// configuration methods can be chained
+    pub(super) fn new(builder: ContainerBuilder, bundle: PathBuf) -> Self {
+        Self {
+            base: builder,
+            bundle,
+            use_systemd: true,
+            cgroups_disabled: false,
+            detached: true,
+            no_pivot: false,
+            canonicalize_rootfs: false,
+            as_sibling: false,
+        }
+    }
+
+    /// Sets if systemd should be used for managing cgroups
+    pub fn with_systemd(mut self, should_use: bool) -> Self {
+        self.use_systemd = should_use;
+        self
+    }
+
+    pub fn with_cgroups_disabled(mut self, disabled: bool) -> Self {
+        self.cgroups_disabled = disabled;
+        self
+    }
+
+    /// Sets if the init process should be run as a child or a sibling of
+    /// the calling process
+    pub fn as_sibling(mut self, as_sibling: bool) -> Self {
+        self.as_sibling = as_sibling;
+        self
+    }
+
+    pub fn with_detach(mut self, detached: bool) -> Self {
+        self.detached = detached;
+        self
+    }
+
+    pub fn with_no_pivot(mut self, no_pivot: bool) -> Self {
+        self.no_pivot = no_pivot;
+        self
+    }
+
+    pub fn with_canonicalize_rootfs(mut self, canonicalize: bool) -> Self {
+        self.canonicalize_rootfs = canonicalize;
+        self
+    }
+
+    /// Overrides the OCI bundle path for the container
+    ///
+    /// Replaces the bundle set by [`ContainerBuilder::as_init`].
+    pub fn with_bundle<P: Into<PathBuf>>(mut self, bundle: P) -> Self {
+        self.bundle = bundle.into();
+        self
+    }
+
+    /// Creates a new container
+    pub fn build(self) -> Result<Container, LibcontainerError> {
+        let spec = self.load_spec()?;
+        // validate terminal field against console socket presence before any side effects
+        // (mirrors runc's checkTerminal called at the top of runner.run())
+        self.base.check_terminal(&spec, self.detached)?;
+
+        let container_dir = self.create_container_dir()?;
+
+        let mut container = self.create_container_state(&container_dir)?;
+        container
+            .set_systemd(self.use_systemd)
+            .set_cgroups_disabled(self.cgroups_disabled)
+            .set_annotations(spec.annotations().clone());
+
+        let notify_path = container_dir.join(NOTIFY_FILE);
+        // convert path of root file system of the container to absolute path
+        let rootfs = spec
+            .root()
+            .as_ref()
+            .ok_or(MissingSpecError::Root)?
+            .path()
+            .to_path_buf();
+
+        // if socket file path is given in commandline options,
+        // get file descriptors of console socket
+        let csocketfd = if let Some(console_socket) = &self.base.console_socket {
+            Some(tty::setup_console_socket(
+                &container_dir,
+                console_socket,
+                "console-socket",
+            )?)
+        } else {
+            None
+        };
+
+        let user_ns_config = UserNamespaceConfig::new(&spec)?;
+
+        let config = YoukiConfig::from_spec(&spec, container.id())?;
+        config.save(&container_dir).map_err(|err| {
+            tracing::error!(?container_dir, "failed to save config: {}", err);
+            err
+        })?;
+
+        let mut builder_impl = ContainerBuilderImpl {
+            container_type: ContainerType::InitContainer,
+            syscall: self.base.syscall,
+            container_id: self.base.container_id,
+            pid_file: self.base.pid_file,
+            console_socket: csocketfd,
+            use_systemd: self.use_systemd,
+            cgroups_disabled: self.cgroups_disabled,
+            spec: Rc::new(spec),
+            rootfs,
+            canonicalize_rootfs: self.canonicalize_rootfs,
+            user_ns_config,
+            notify_path,
+            container: Some(container.clone()),
+            preserve_fds: self.base.preserve_fds,
+            detached: self.detached,
+            executor: self.base.executor,
+            no_pivot: self.no_pivot,
+            stdin: self.base.stdin,
+            stdout: self.base.stdout,
+            stderr: self.base.stderr,
+            error_fd: self.base.error_fd,
+            as_sibling: self.as_sibling,
+            sub_cgroup_path: None,
+            process_label: None,
+        };
+
+        builder_impl.create()?;
+
+        container.refresh_state()?;
+
+        Ok(container)
+    }
+
+    fn create_container_dir(&self) -> Result<PathBuf, LibcontainerError> {
+        let container_dir = self.base.root_path.join(&self.base.container_id);
+        tracing::debug!("container directory will be {:?}", container_dir);
+
+        if container_dir.exists() {
+            tracing::error!(id = self.base.container_id, dir = ?container_dir, "container already exists");
+            return Err(LibcontainerError::Exist);
+        }
+
+        std::fs::create_dir_all(&container_dir).map_err(|err| {
+            tracing::error!(
+                ?container_dir,
+                "failed to create container directory: {}",
+                err
+            );
+            LibcontainerError::OtherIO(err)
+        })?;
+
+        Ok(container_dir)
+    }
+
+    fn load_spec(&self) -> Result<Spec, LibcontainerError> {
+        let source_spec_path = self.bundle.join("config.json");
+        let spec = Spec::load(source_spec_path)?;
+        Self::validate_spec(&spec)?;
+
+        Ok(spec)
+    }
+
+    fn validate_spec(spec: &Spec) -> Result<(), LibcontainerError> {
+        let version = spec.version();
+        if !version.starts_with("1.") {
+            tracing::error!(
+                "runtime spec has incompatible version '{}'. Only 1.X.Y is supported",
+                spec.version()
+            );
+            Err(ErrInvalidSpec::UnsupportedVersion)?;
+        }
+
+        Validator::validate_spec(spec)?;
+
+        if let Some(process) = spec.process() {
+            if let Some(profile) = process.apparmor_profile() {
+                let apparmor_is_enabled = apparmor::is_enabled().map_err(|err| {
+                    tracing::error!(?err, "failed to check if apparmor is enabled");
+                    LibcontainerError::OtherIO(err)
+                })?;
+                if !apparmor_is_enabled {
+                    tracing::error!(
+                        ?profile,
+                        "apparmor profile exists in the spec, but apparmor is not activated on this system"
+                    );
+                    Err(ErrInvalidSpec::AppArmorNotEnabled)?;
+                }
+            }
+        }
+
+        let syscall = create_syscall();
+
+        if let Some(mounts) = spec.mounts() {
+            utils::validate_mount_options(mounts)?;
+            validate_idmapped_mounts(mounts, spec.linux().as_ref(), &*syscall)?;
+        }
+
+        utils::validate_spec_for_net_devices(spec, &*syscall)
+            .map_err(LibcontainerError::NetDevicesError)?;
+
+        Ok(())
+    }
+
+    fn create_container_state(&self, container_dir: &Path) -> Result<Container, LibcontainerError> {
+        let container = Container::new(
+            &self.base.container_id,
+            ContainerStatus::Creating,
+            None,
+            &self.bundle,
+            container_dir,
+        )?;
+        container.save()?;
+        Ok(container)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::container::builder::ContainerBuilder;
+    use crate::syscall::syscall::SyscallType;
+
+    #[test]
+    fn test_with_bundle() {
+        let builder = ContainerBuilder::new("test-id".to_owned(), SyscallType::default())
+            .as_init("/original/bundle")
+            .with_bundle("/new/bundle");
+
+        assert_eq!(builder.bundle, PathBuf::from("/new/bundle"));
+    }
+
+    #[test]
+    fn test_with_cgroups_disabled() {
+        let builder = ContainerBuilder::new("test-id".to_owned(), SyscallType::default())
+            .as_init("/bundle")
+            .with_cgroups_disabled(true);
+
+        assert!(builder.cgroups_disabled);
+    }
+}
