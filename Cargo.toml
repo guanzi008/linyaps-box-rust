@@ -1,3 +1,7 @@
+[workspace]
+exclude = ["vendor/libcontainer"]
+resolver = "3"
+
 [package]
 name = "linyaps-box"
 version = "2.3.0"
