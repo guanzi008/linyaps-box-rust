@@ -1,0 +1,85 @@
+Source: linyaps-box-rust
+Section: admin
+Priority: optional
+Maintainer: guanzi008 <20619190+guanzi008@users.noreply.github.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-sequence-rust,
+Build-Depends-Arch:
+ cargo:native,
+ librust-anyhow-1+default-dev (>= 1.0.102-~~),
+ librust-assert-cmd-2+default-dev (>= 2.1.2-~~) <!nocheck>,
+ librust-caps-0.5+default-dev (>= 0.5.6-~~),
+ librust-chrono-0.4+clock-dev (>= 0.4.44-~~),
+ librust-chrono-0.4+serde-dev (>= 0.4.44-~~),
+ librust-clap-4+default-dev (>= 4.5.60-~~),
+ librust-clap-4+derive-dev (>= 4.5.60-~~),
+ librust-clap-4+env-dev (>= 4.5.60-~~),
+ librust-fastrand-2+default-dev (>= 2.3.0-~~),
+ librust-libc-0.2+default-dev (>= 0.2.186-~~),
+ librust-libcgroups-0.7+systemd-dev (>= 0.7.0-~~),
+ librust-libcgroups-0.7+v1-dev (>= 0.7.0-~~),
+ librust-libcgroups-0.7+v2-dev (>= 0.7.0-~~),
+ librust-libcgroups-0.7-dev (>= 0.7.0-~~),
+ librust-netlink-packet-core-0.8+default-dev (>= 0.8.1-~~),
+ librust-netlink-packet-route-0.31+default-dev (>= 0.31.0-~~),
+ librust-netlink-sys-0.8+default-dev (>= 0.8.8-~~),
+ librust-nix-0.29+default-dev (>= 0.29.0-~~),
+ librust-nix-0.29+dir-dev (>= 0.29.0-~~),
+ librust-nix-0.29+fs-dev (>= 0.29.0-~~),
+ librust-nix-0.29+hostname-dev (>= 0.29.0-~~),
+ librust-nix-0.29+mman-dev (>= 0.29.0-~~),
+ librust-nix-0.29+mount-dev (>= 0.29.0-~~),
+ librust-nix-0.29+personality-dev (>= 0.29.0-~~),
+ librust-nix-0.29+process-dev (>= 0.29.0-~~),
+ librust-nix-0.29+resource-dev (>= 0.29.0-~~),
+ librust-nix-0.29+sched-dev (>= 0.29.0-~~),
+ librust-nix-0.29+signal-dev (>= 0.29.0-~~),
+ librust-nix-0.29+socket-dev (>= 0.29.0-~~),
+ librust-nix-0.29+term-dev (>= 0.29.0-~~),
+ librust-nix-0.29+uio-dev (>= 0.29.0-~~),
+ librust-nix-0.29+user-dev (>= 0.29.0-~~),
+ librust-oci-spec-0.10+default-dev (>= 0.10.0-~~),
+ librust-oci-spec-0.10+runtime-dev (>= 0.10.0-~~),
+ librust-pathrs-0.2+default-dev (>= 0.2.4-~~),
+ librust-prctl-1+default-dev,
+ librust-predicates-3+default-dev (>= 3.1.4-~~) <!nocheck>,
+ librust-procfs-0.18+default-dev (>= 0.18.0-~~),
+ librust-regex-1+std-dev (>= 1.12.4-~~),
+ librust-regex-1+unicode-perl-dev (>= 1.12.4-~~),
+ librust-rust-criu-0.6+default-dev (>= 0.6.1-~~),
+ librust-safe-path-0.1+default-dev (>= 0.1.0-~~),
+ librust-serde-1+default-dev (>= 1.0.228-~~),
+ librust-serde-1+derive-dev (>= 1.0.228-~~),
+ librust-serde-json-1+default-dev (>= 1.0.149-~~),
+ librust-tempfile-3+default-dev (>= 3.27.0-~~),
+ librust-thiserror-2+default-dev (>= 2.0.18-~~),
+ librust-tracing-0.1+attributes-dev (>= 0.1.44-~~),
+ librust-tracing-0.1+default-dev (>= 0.1.44-~~),
+ librust-tracing-subscriber-0.3+default-dev (>= 0.3.23-~~),
+ librust-tracing-subscriber-0.3+env-filter-dev (>= 0.3.23-~~),
+ librust-tracing-subscriber-0.3+json-dev (>= 0.3.23-~~),
+ libstd-rust-dev,
+ rustc:native (>= 1.88),
+Standards-Version: 4.7.4
+Homepage: https://github.com/LFRon/linyaps-box-rust-deb
+Vcs-Git: https://github.com/LFRon/linyaps-box-rust-deb.git
+Vcs-Browser: https://github.com/LFRon/linyaps-box-rust-deb
+Rules-Requires-Root: no
+X-Cargo-Crate: linyaps-box
+
+Package: linglong-box
+Architecture: linux-any
+X-Cargo-Crates:
+ linyaps-box,
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Built-Using:
+ ${cargo:Built-Using},
+Static-Built-Using:
+ ${cargo:Static-Built-Using},
+Description: Linyaps OCI runtime implemented in Rust
+ A command-compatible Rust implementation of the Linyaps OCI runtime.  It
+ provides the run, exec, kill and list operations used for desktop application
+ containers.

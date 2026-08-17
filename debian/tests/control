@@ -1,0 +1,6 @@
+Tests:
+ smoke,
+Depends:
+ @,
+Restrictions:
+ superficial,

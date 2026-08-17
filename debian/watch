@@ -1,0 +1,5 @@
+version=4
+opts=filenamemangle=s%(?:.*?)?v?(\d[\d.]*-rust\.\d+)\.tar\.gz%linyaps-box-rust-$1.tar.gz%,\
+uversionmangle=s/-rust\./~rust/ \
+https://github.com/LFRon/linyaps-box-rust-deb/tags \
+(?:.*?/)?v?(\d[\d.]*-rust\.\d+)\.tar\.gz

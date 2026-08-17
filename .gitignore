@@ -1,5 +1,11 @@
 target/
-dist/
 *.log
 *.rs.bk
 .DS_Store
+/debian/.debhelper/
+/debian/cargo_home/
+/debian/cargo_registry/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/linglong-box/
+/.debhelper/
