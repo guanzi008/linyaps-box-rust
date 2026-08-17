@@ -23,5 +23,17 @@ cargo build --release --locked
 ../linyaps-rust/tests/system/runtime-e2e.sh
 ```
 
+## Debian 包
+
+在 Debian/Ubuntu 构建机上安装 `dpkg-dev`、`binutils` 和 Rust 后执行：
+
+```sh
+./packaging/debian/build-deb.sh
+```
+
+产物为 `dist/linglong-box_<version>_<architecture>.deb` 和
+`dist/SHA256SUMS`。也可使用 `DEB_VERSION`、`DEB_ARCH`、`OUTPUT_DIR` 和
+`SOURCE_DATE_EPOCH` 覆盖默认元数据。
+
 项目代码许可证为 `LGPL-3.0-or-later`；vendored Youki `libcontainer` 保持其
 `Apache-2.0` 许可证，完整文本与冻结上游 REUSE 许可证集合均位于 `LICENSES/`。

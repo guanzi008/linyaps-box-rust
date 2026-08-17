@@ -1,0 +1,75 @@
+name: Release Debian package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  debian-package:
+    runs-on: ubuntu-24.04
+    container: rust:1.88-bookworm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packaging tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends binutils dpkg-dev gh lintian xz-utils
+      - name: Derive Debian version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version=${GITHUB_REF_NAME#v}
+            version=${version/-rust./~rust}
+            echo "deb_version=${version}-1" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Build Debian package
+        env:
+          DEB_VERSION: ${{ steps.version.outputs.deb_version }}
+        run: ./packaging/debian/build-deb.sh
+      - name: Verify Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=$(find dist -maxdepth 1 -name 'linglong-box_*.deb' -print -quit)
+          dpkg-deb --info "$package"
+          dpkg-deb --contents "$package" >/dev/null
+          lintian --fail-on error "$package"
+          root=$(mktemp -d)
+          dpkg-deb --extract "$package" "$root"
+          "$root/usr/bin/ll-box" --version
+          sha256sum --check dist/SHA256SUMS
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linglong-box-debian-${{ github.sha }}
+          path: |
+            dist/*.deb
+            dist/SHA256SUMS
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --prerelease \
+              --generate-notes \
+              --title "linyaps-box-rust ${GITHUB_REF_NAME#v}"
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
