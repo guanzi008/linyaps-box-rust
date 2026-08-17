@@ -353,28 +353,28 @@ fn validate_config(value: &Value) -> Result<()> {
             bail!("root.readonly must be a boolean");
         }
     }
-    if let Some(linux) = value.get("linux").filter(|value| !value.is_null()) {
-        if let Some(linux) = linux.as_object() {
-            validate_linux(linux)?;
-        }
+    if let Some(linux) = value.get("linux").filter(|value| !value.is_null())
+        && let Some(linux) = linux.as_object()
+    {
+        validate_linux(linux)?;
     }
-    if let Some(hooks) = value.get("hooks").filter(|value| !value.is_null()) {
-        if let Some(hooks) = hooks.as_object() {
-            for name in [
-                "prestart",
-                "createRuntime",
-                "createContainer",
-                "startContainer",
-                "poststart",
-                "poststop",
-            ] {
-                if let Some(entries) = hooks.get(name).filter(|value| !value.is_null()) {
-                    let entries = entries
-                        .as_array()
-                        .with_context(|| format!("hooks.{name} must be an array"))?;
-                    for hook in entries {
-                        validate_hook(hook)?;
-                    }
+    if let Some(hooks) = value.get("hooks").filter(|value| !value.is_null())
+        && let Some(hooks) = hooks.as_object()
+    {
+        for name in [
+            "prestart",
+            "createRuntime",
+            "createContainer",
+            "startContainer",
+            "poststart",
+            "poststop",
+        ] {
+            if let Some(entries) = hooks.get(name).filter(|value| !value.is_null()) {
+                let entries = entries
+                    .as_array()
+                    .with_context(|| format!("hooks.{name} must be an array"))?;
+                for hook in entries {
+                    validate_hook(hook)?;
                 }
             }
         }
@@ -2015,14 +2015,14 @@ fn normalize_paths(value: &mut Value, bundle: &Path) -> Result<()> {
                         .filter_map(Value::as_str)
                         .any(|option| matches!(option, "bind" | "rbind"))
                 });
-            if !is_bind && object.get("source").is_none_or(Value::is_null) {
-                if let Some(mount_type) = object
+            if !is_bind
+                && object.get("source").is_none_or(Value::is_null)
+                && let Some(mount_type) = object
                     .get("type")
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                {
-                    object.insert("source".to_string(), Value::String(mount_type));
-                }
+            {
+                object.insert("source".to_string(), Value::String(mount_type));
             }
             if !is_bind {
                 continue;

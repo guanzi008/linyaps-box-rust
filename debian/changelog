@@ -1,3 +1,17 @@
+linyaps-box-rust (2.3.0~rust1-3) unstable; urgency=medium
+
+  * Rebuild the Rust OCI runtime for the final Deepin 23 and 25 set.
+  * Verify run, exec, kill, cleanup, and container reuse with ll-cli.
+
+ -- guanzi008 <20619190+guanzi008@users.noreply.github.com>  Mon, 17 Aug 2026 18:10:00 +0800
+
+linyaps-box-rust (2.3.0~rust1-2) unstable; urgency=medium
+
+  * Rebuild the Rust OCI runtime for the Deepin 23 and 25 release set.
+  * Keep command-line and configuration parsing clean under Rust 1.95.
+
+ -- guanzi008 <20619190+guanzi008@users.noreply.github.com>  Mon, 17 Aug 2026 17:20:52 +0800
+
 linyaps-box-rust (2.3.0~rust1-1) unstable; urgency=medium
 
   * Initial Debian release of the Rust implementation.

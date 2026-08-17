@@ -254,10 +254,10 @@ fn missing_option_value(arguments: &[OsString], command: Option<&str>) -> Option
         } else {
             None
         };
-        if let Some((name, type_name)) = specification {
-            if index + 1 == arguments.len() {
-                return Some(format!("{name}: 1 required {type_name} missing"));
-            }
+        if let Some((name, type_name)) = specification
+            && index + 1 == arguments.len()
+        {
+            return Some(format!("{name}: 1 required {type_name} missing"));
         }
     }
     None

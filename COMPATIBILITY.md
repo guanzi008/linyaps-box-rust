@@ -37,4 +37,4 @@ cargo test --all-targets --locked
 cargo build --release --locked
 ```
 
-测试覆盖 CLI、配置归一化、状态、日志、hook、exec、信号、console、生命周期和错误映射；另有冻结 `ll-box-st` 套件及 C++/Rust 差分矩阵。与 `linyaps-rust` 配对后，`tests/system/runtime-e2e.sh` 验证 builder 导入、package manager、CLI、OCI runtime、`ll-init` 和应用退出清理的完整链路。
+测试覆盖 CLI、配置归一化、状态、日志、hook、exec、信号、console、生命周期和错误映射；另有冻结 `ll-box-st` 套件及 C++/Rust 差分矩阵。与 `linyaps-rust` 配对后，`tests/system/runtime-e2e.sh` 验证 builder 导入、package manager、CLI、OCI runtime、`ll-init` 和应用退出清理的完整链路。发布验证还在 Deepin 25 虚拟机中实际启动系统仓库的 `org.deepin.calculator`，检查窗口、进程状态、信号退出、状态目录和挂载清理。
