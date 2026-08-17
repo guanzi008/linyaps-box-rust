@@ -18,6 +18,8 @@ jobs:
     container: rust:1.88-bookworm
     steps:
       - uses: actions/checkout@v7
+      - name: Trust checked-out repository
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install packaging tools
         run: |
           apt-get update
