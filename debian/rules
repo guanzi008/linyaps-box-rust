@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/buildflags.mk
+include /usr/share/rustc/architecture.mk
+
+export CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+export DEB_HOST_GNU_TYPE DEB_HOST_RUST_TYPE
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+export CARGO_NET_OFFLINE = true
+export CARGO_PROFILE_RELEASE_STRIP = false
+
+%:
+	dh $@
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS) $(DEB_BUILD_PROFILES)))
+	dh_auto_test --buildsystem=rust -- --all-targets
+else
+	@:
+endif
+
+override_dh_missing:
+	dh_missing --fail-missing

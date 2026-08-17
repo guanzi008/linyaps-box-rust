@@ -25,15 +25,18 @@ cargo build --release --locked
 
 ## Debian 包
 
-在 Debian/Ubuntu 构建机上安装 `dpkg-dev`、`binutils` 和 Rust 后执行：
+仓库包含标准 Debian 源码包目录 `debian/`，并通过 `dh-rust` 离线使用
+Debian 提供的 `librust-*-dev` crate。先启用包含这些构建依赖的 Debian
+仓库，然后执行：
 
 ```sh
-./packaging/debian/build-deb.sh
+sudo apt build-dep ./
+dpkg-buildpackage --build=binary --no-sign
 ```
 
-产物为 `dist/linglong-box_<version>_<architecture>.deb` 和
-`dist/SHA256SUMS`。也可使用 `DEB_VERSION`、`DEB_ARCH`、`OUTPUT_DIR` 和
-`SOURCE_DATE_EPOCH` 覆盖默认元数据。
+构建结果按照 Debian 惯例写入源码目录的上一级，包括 `linglong-box`、
+`.changes` 和 `.buildinfo`。版本、架构、共享库依赖、调试符号拆分及校验和
+均由 Debian 工具链管理；发布新版本时应先更新 `debian/changelog`。
 
 项目代码许可证为 `LGPL-3.0-or-later`；vendored Youki `libcontainer` 保持其
 `Apache-2.0` 许可证，完整文本与冻结上游 REUSE 许可证集合均位于 `LICENSES/`。

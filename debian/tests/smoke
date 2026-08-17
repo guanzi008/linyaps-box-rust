@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+ll-box --version
+ll-box --help >/dev/null

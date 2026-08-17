@@ -1,0 +1,18 @@
+Linyaps Box Rust Debian packaging
+================================
+
+The package is built with dh-rust against crate source packages from the
+Debian Cargo registry.  Cargo is configured by dh-rust to remain offline;
+network downloads during the package build are not supported.
+
+The feature-level Build-Depends list is the union of the direct external
+dependencies declared by linyaps-box and the bundled libcontainer crate.  It
+is kept in debian/control because apt must resolve build dependencies before
+debian/rules can run.  Runtime shared-library dependencies and the Rust source
+relationships in Built-Using are generated during the build.
+
+The upstream source embeds the selected Youki libcontainer crate as a local
+path dependency because it forms the implementation boundary of this runtime.
+Its license is recorded separately in debian/copyright.  All of its external
+Rust dependencies, and all other dependencies of linyaps-box, must be supplied
+by the Debian librust-*-dev packages listed in debian/control.

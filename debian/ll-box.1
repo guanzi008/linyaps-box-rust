@@ -1,0 +1,42 @@
+.TH LL-BOX 1 "August 2026" "Linyaps Box 2.3.0" "User Commands"
+.SH NAME
+ll-box \- OCI runtime for Linyaps desktop applications
+.SH SYNOPSIS
+.B ll-box
+.RI [ global-options ]
+.I command
+.RI [ command-options ]
+.SH DESCRIPTION
+.B ll-box
+is the OCI runtime used by Linyaps.  It manages desktop application containers
+and implements the OCI runtime operations required by the Linyaps package
+manager.
+.SH COMMANDS
+.TP
+.B list
+List known containers.
+.TP
+.B run
+Create and immediately start a container.
+.TP
+.B exec
+Execute a command in a running container.
+.TP
+.B kill
+Send a signal to a container's initial process.
+.SH OPTIONS
+.TP
+.B \-h, \-\-help
+Show command help.
+.TP
+.B \-v, \-\-version
+Show runtime and OCI specification versions.
+.TP
+.BI \-\-root " directory"
+Use an alternate runtime state directory.
+.TP
+.BI \-\-log " destination"
+Select a logging destination.
+.SH SEE ALSO
+.BR ll-cli (1),
+.BR runc (8)

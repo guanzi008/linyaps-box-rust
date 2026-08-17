@@ -1,0 +1,6 @@
+linyaps-box-rust (2.3.0~rust1-1) unstable; urgency=medium
+
+  * Initial Debian release of the Rust implementation.
+  * Replace the ad-hoc dpkg-deb builder with a dh-rust source package.
+
+ -- guanzi008 <20619190+guanzi008@users.noreply.github.com>  Mon, 17 Aug 2026 12:00:00 +0800
