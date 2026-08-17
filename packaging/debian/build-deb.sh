@@ -46,6 +46,7 @@ if [[ -z "$package_version" ]]; then
 fi
 
 deb_version=${DEB_VERSION:-${package_version}~rust1-1}
+artifact_version=${deb_version//\~/.}
 deb_arch=${DEB_ARCH:-$(detect_architecture)}
 native_arch=$(detect_architecture)
 output_dir=${OUTPUT_DIR:-$project_root/dist}
@@ -183,7 +184,7 @@ find "$package_root" -print0 \
     | xargs -0 touch --no-dereference --date="@$source_date_epoch"
 
 mkdir -p "$output_dir"
-artifact=$output_dir/linglong-box_${deb_version}_${deb_arch}.deb
+artifact=$output_dir/linglong-box_${artifact_version}_${deb_arch}.deb
 dpkg-deb --root-owner-group --uniform-compression -Zxz -z9 \
     --build "$package_root" "$artifact"
 
