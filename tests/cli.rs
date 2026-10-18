@@ -11,7 +11,7 @@ fn version_matches_original_shape() {
         .arg("--version")
         .assert()
         .success()
-        .stdout("ll-box version 2.3.0-dev-\nspec 1.3.0\n\n");
+        .stdout("ll-box version 2.4.0-dev-\nspec 1.3.0\n\n");
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn empty_list_prints_original_header() {
         .args(["--root", root.to_str().unwrap(), "list"])
         .assert()
         .success()
-        .stdout(predicate::str::starts_with("NAME PID"));
+        .stdout(predicate::str::starts_with("NAMEPID"));
     assert!(fs::metadata(root).unwrap().is_dir());
 }
 
@@ -64,7 +64,7 @@ fn nonempty_list_matches_original_json_and_table_formatting() {
     .unwrap();
 
     let expected_json = format!(
-        "[\n    {{\n        \"annotations\": {{}},\n        \"bundle\": \"/bundle path\",\n        \"created\": \"0\",\n        \"id\": \"demo\",\n        \"ociVersion\": \"1.3.0\",\n        \"owner\": \"tester\",\n        \"pid\": {},\n        \"status\": \"running\"\n    }}\n]\n",
+        "[\n    {{\n        \"annotations\": {{}},\n        \"bundle\": \"/bundle path\",\n        \"created\": \"1970-01-01T00:00:00.000000Z\",\n        \"id\": \"demo\",\n        \"ociVersion\": \"1.3.0\",\n        \"owner\": \"tester\",\n        \"pid\": {},\n        \"status\": \"running\"\n    }}\n]\n",
         std::process::id()
     );
     let mut json = Command::cargo_bin("ll-box").unwrap();
@@ -131,7 +131,7 @@ fn explicit_file_sink_receives_json_logs() {
     let value: serde_json::Value =
         serde_json::from_str(fs::read_to_string(&log).unwrap().trim()).unwrap();
     assert_eq!(value["level"], "ERROR");
-    assert!(value["msg"].as_str().unwrap().starts_with("Error: "));
+    assert!(value["message"].as_str().unwrap().starts_with("Error: "));
     assert_eq!(value["function"], "main");
     assert_eq!(value["file"], "main.rs");
     assert!(value["line"].as_u64().unwrap() > 0);
@@ -246,7 +246,7 @@ fn variadic_logs_and_numeric_flags_match_cli11() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::starts_with("NAME PID"));
+        .stdout(predicate::str::starts_with("NAMEPID"));
     assert!(log.is_file());
 }
 

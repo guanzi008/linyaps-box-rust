@@ -4,7 +4,6 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use libcontainer::container::builder::ContainerBuilder;
@@ -20,9 +19,10 @@ use nix::unistd::{Pid, pipe2};
 use crate::cli::{CgroupManager, ExecOptions, GlobalOptions, KillOptions, ListOptions, RunOptions};
 use crate::config::{PreparedBundle, process_console_size, process_uses_terminal};
 use crate::exec::{ExecChildError, spawn};
+use crate::process_handle::ProcessHandle;
 use crate::status::{
-    RuntimeStatus, Status, list_statuses, load_status, print_statuses, remove_status_directory,
-    save_config, validate_id, write_status,
+    RuntimeStatus, Status, created_now, list_statuses, load_status, print_statuses,
+    remove_status_directory, save_config, validate_id, write_status,
 };
 
 const INTERNAL_RUNTIME_DIRECTORY: &str = ".runtime";
@@ -54,11 +54,7 @@ pub fn run(options: &RunOptions, global: &GlobalOptions) -> Result<i32> {
                 .or_else(|| internal_console.as_ref().map(InternalConsole::path))
         })
         .flatten();
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_nanos()
-        .to_string();
+    let created = created_now();
     let mut compatibility_status = Status::creating(
         options.container.clone(),
         prepared.original_bundle().to_path_buf(),
@@ -128,6 +124,19 @@ pub fn run(options: &RunOptions, global: &GlobalOptions) -> Result<i32> {
             .pid()
             .context("container state did not record an init pid")?
             .as_raw();
+        let process = ProcessHandle::open(compatibility_status.pid)
+            .with_context(|| {
+                format!(
+                    "failed to open container process {}",
+                    compatibility_status.pid
+                )
+            })?
+            .status()
+            .context("failed to get container process start time")?;
+        if process.start_time == 0 {
+            bail!("container process start time must not be zero");
+        }
+        compatibility_status.process_start_time = Some(process.start_time);
         compatibility_status.status = RuntimeStatus::Created;
         write_status(&global.root, &compatibility_status)?;
         prepared.validate_namespace_paths()?;
@@ -346,7 +355,12 @@ pub fn exec(options: &ExecOptions, global: &GlobalOptions) -> Result<i32> {
         bail!("container not found");
     }
     let status = load_status(&status_directory.join("status.json"))?;
-    let spawned = spawn(status.pid, &status_directory.join("config.json"), options)?;
+    let process = verify_container_process(&status, "exec process")?;
+    let spawned = spawn(
+        process.pid(),
+        &status_directory.join("config.json"),
+        options,
+    )?;
     let console_forwarder = spawned
         .console
         .map(|console| ConsoleForwarder::start(console, None))
@@ -367,9 +381,9 @@ pub fn kill(options: &KillOptions, global: &GlobalOptions) -> Result<i32> {
         bail!("container not found");
     }
     let status = load_status(&directory.join("status.json"))?;
+    let process = verify_container_process(&status, "send signal")?;
     let signal = Signal::try_from(options.signal.as_str())?;
-    if unsafe { libc::kill(status.pid, signal.into_raw()) } == -1 {
-        let error = std::io::Error::last_os_error();
+    if let Err(error) = process.send_signal(signal.into_raw()) {
         let message = error
             .raw_os_error()
             .map(errno_message)
@@ -381,6 +395,34 @@ pub fn kill(options: &KillOptions, global: &GlobalOptions) -> Result<i32> {
         );
     }
     Ok(0)
+}
+
+fn verify_container_process(status: &Status, action: &str) -> Result<ProcessHandle> {
+    let handle = ProcessHandle::open(status.pid)
+        .with_context(|| format!("failed to open container process {}", status.pid))?;
+    let process = handle.status().with_context(|| {
+        format!(
+            "cannot read status of container process {} before {action}",
+            status.pid
+        )
+    })?;
+    if process.state.is_dead() {
+        bail!("container process {} is not running", status.pid);
+    }
+    let Some(expected_start_time) = status.process_start_time else {
+        tracing::warn!(
+            pid = status.pid,
+            "legacy state does not record process startup time; process identity cannot be verified"
+        );
+        return Ok(handle);
+    };
+    if process.start_time != expected_start_time {
+        bail!(
+            "container PID {} was reused by another process; refusing to {action}",
+            status.pid
+        );
+    }
+    Ok(handle)
 }
 
 struct InternalConsole {
@@ -508,6 +550,7 @@ fn detect_host_terminal() -> Result<(Option<RawFd>, Option<File>)> {
 
 struct ConsoleForwarder {
     master: File,
+    mirror_host_size: bool,
     output: JoinHandle<Result<()>>,
     _terminal: TerminalGuard,
 }
@@ -515,6 +558,7 @@ struct ConsoleForwarder {
 impl ConsoleForwarder {
     fn start(master: OwnedFd, configured_size: Option<(u16, u16)>) -> Result<Self> {
         let master = File::from(master);
+        let mirror_host_size = configured_size.is_none();
         if let Some((height, width)) = configured_size {
             set_console_size(master.as_raw_fd(), height, width)?;
         }
@@ -542,6 +586,7 @@ impl ConsoleForwarder {
         });
         let forwarder = Self {
             master,
+            mirror_host_size,
             output,
             _terminal: terminal,
         };
@@ -550,6 +595,9 @@ impl ConsoleForwarder {
     }
 
     fn resize(&self) {
+        if !self.mirror_host_size {
+            return;
+        }
         let Some(descriptor) = self._terminal.descriptor() else {
             return;
         };

@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use crate::capability;
 use crate::cli::ExecOptions;
+use crate::strict_json;
 
 const MESSAGE_PID: u8 = b'P';
 const MESSAGE_PROCEED: u8 = b'G';
@@ -159,7 +160,7 @@ pub(crate) fn spawn(
     config_path: &Path,
     options: &ExecOptions,
 ) -> Result<SpawnedExec> {
-    let config: Value = serde_json::from_slice(
+    let config: Value = strict_json::value_from_slice(
         &fs::read(config_path)
             .with_context(|| format!("failed to open config file: {}", config_path.display()))?,
     )
@@ -237,7 +238,7 @@ pub(crate) fn spawn(
 }
 
 fn read_process_file(path: &Path) -> Result<ExecProcess> {
-    let value: Value = serde_json::from_slice(
+    let value: Value = strict_json::value_from_slice(
         &fs::read(path).with_context(|| format!("cannot open process file: {}", path.display()))?,
     )
     .context("cannot parse process file")?;
@@ -352,10 +353,7 @@ fn validate_ignored_process_fields(object: &serde_json::Map<String, Value>) -> R
         }
     }
     if let Some(value) = object.get("oomScoreAdj").filter(|value| !value.is_null()) {
-        let value = value
-            .as_i64()
-            .context("process.oomScoreAdj must be an integer")?;
-        i32::try_from(value).context("process.oomScoreAdj is out of range")?;
+        strict_json::as_i32(value).context("process.oomScoreAdj must be an in-range integer")?;
     }
     if let Some(value) = object.get("scheduler").filter(|value| !value.is_null()) {
         parse_scheduler(value)?;
@@ -394,10 +392,8 @@ fn parse_scheduler(value: &Value) -> Result<()> {
     }
     for field in ["nice", "priority"] {
         if let Some(value) = object.get(field).filter(|value| !value.is_null()) {
-            let value = value
-                .as_i64()
-                .with_context(|| format!("scheduler.{field} must be an integer"))?;
-            i32::try_from(value).with_context(|| format!("scheduler.{field} is out of range"))?;
+            strict_json::as_i32(value)
+                .with_context(|| format!("scheduler.{field} must be an in-range integer"))?;
         }
     }
     if let Some(flags) = object.get("flags").filter(|value| !value.is_null()) {
@@ -424,8 +420,7 @@ fn parse_scheduler(value: &Value) -> Result<()> {
     }
     for field in ["runtime", "deadline", "period"] {
         if let Some(value) = object.get(field).filter(|value| !value.is_null()) {
-            value
-                .as_u64()
+            strict_json::as_u64(value)
                 .with_context(|| format!("scheduler.{field} must be an unsigned integer"))?;
         }
     }
@@ -447,10 +442,7 @@ fn parse_io_priority(value: &Value) -> Result<()> {
         bail!("unknown value: {class}");
     }
     if let Some(priority) = object.get("priority") {
-        let priority = priority
-            .as_i64()
-            .context("ioPriority.priority must be an integer")?;
-        i32::try_from(priority).context("ioPriority.priority is out of range")?;
+        strict_json::as_i32(priority).context("ioPriority.priority must be an in-range integer")?;
     }
     Ok(())
 }
@@ -494,10 +486,7 @@ fn parse_user(value: &Value) -> Result<ExecUser> {
                 .context("process.user.additionalGids must be an array")?
                 .iter()
                 .map(|value| {
-                    let value = value
-                        .as_u64()
-                        .context("process.user.additionalGids entries must be unsigned integers")?;
-                    u32::try_from(value)
+                    strict_json::as_u32(value)
                         .context("process.user.additionalGids entry is out of range")
                 })
                 .collect::<Result<Vec<_>>>()
@@ -506,12 +495,7 @@ fn parse_user(value: &Value) -> Result<ExecUser> {
     let umask = object
         .get("umask")
         .filter(|value| !value.is_null())
-        .map(|value| {
-            let value = value
-                .as_u64()
-                .context("process.user.umask must be an unsigned integer")?;
-            u32::try_from(value).context("process.user.umask is out of range")
-        })
+        .map(|value| strict_json::as_u32(value).context("process.user.umask is out of range"))
         .transpose()?;
     Ok(ExecUser {
         uid: required_u32(object.get("uid"), "process.user.uid")?,
@@ -615,7 +599,7 @@ fn required_u32(value: Option<&Value>, field: &str) -> Result<u32> {
 
 fn required_u64(value: Option<&Value>, field: &str) -> Result<u64> {
     value
-        .and_then(Value::as_u64)
+        .and_then(strict_json::as_u64)
         .with_context(|| format!("{field} is required"))
 }
 
@@ -1336,6 +1320,29 @@ mod tests {
         assert_eq!(process.terminal, Some(false));
         assert_eq!(process.console_size, None);
         assert_eq!(process.no_new_privileges, Some(false));
+    }
+
+    #[test]
+    fn process_parser_checks_integer_ranges_and_accepts_integral_floats() {
+        let process = parse_process(&serde_json::json!({
+            "cwd": "/",
+            "args": ["true"],
+            "user": {"uid": 5.0, "gid": 6.0, "additionalGids": [7.0]},
+            "rlimits": [{"type": "RLIMIT_NOFILE", "soft": 10.0, "hard": 20.0}]
+        }))
+        .unwrap();
+        assert_eq!(process.user.uid, 5);
+        assert_eq!(process.user.gid, 6);
+        assert_eq!(process.user.additional_gids, Some(vec![7]));
+
+        assert!(
+            parse_process(&serde_json::json!({
+                "cwd": "/",
+                "args": ["true"],
+                "user": {"uid": 4_294_967_296_u64, "gid": 0}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

@@ -5,11 +5,13 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use nix::errno::Errno;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::OCI_VERSION;
 use crate::cli::ListFormat;
+use crate::process_handle::ProcessHandle;
+use crate::strict_json;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -26,11 +28,18 @@ pub struct Status {
     pub id: String,
     #[serde(rename = "pid")]
     pub pid: i32,
-    #[serde(rename = "status")]
+    #[serde(
+        rename = "process-start-time",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_process_start_time"
+    )]
+    pub process_start_time: Option<u64>,
+    #[serde(rename = "status", default = "default_runtime_status")]
     pub status: RuntimeStatus,
     #[serde(rename = "bundle")]
     pub bundle: PathBuf,
-    #[serde(rename = "created")]
+    #[serde(rename = "created", deserialize_with = "deserialize_created")]
     pub created: String,
     #[serde(rename = "owner")]
     pub owner: String,
@@ -49,6 +58,7 @@ impl Status {
         Ok(Self {
             id,
             pid: std::process::id() as i32,
+            process_start_time: None,
             status: RuntimeStatus::Creating,
             bundle: original_bundle,
             created,
@@ -59,18 +69,105 @@ impl Status {
     }
 
     pub fn refresh_liveness(&mut self) -> Result<()> {
-        if unsafe { libc::kill(self.pid, 0) } == 0 {
+        if self.pid <= 0 {
+            self.status = RuntimeStatus::Creating;
             return Ok(());
         }
-        match Errno::last() {
-            Errno::EPERM => Ok(()),
-            Errno::ESRCH => {
+        let handle = match ProcessHandle::open(self.pid) {
+            Ok(handle) => handle,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
                 self.status = RuntimeStatus::Stopped;
-                Ok(())
+                return Ok(());
             }
-            error => Err(error).context("failed to probe container process"),
+            Err(error) => {
+                tracing::info!(
+                    pid = self.pid,
+                    "failed to get container process handle: {error}"
+                );
+                return Ok(());
+            }
+        };
+        let process = match handle.status() {
+            Ok(process) => process,
+            Err(error) => {
+                tracing::info!(
+                    pid = self.pid,
+                    "failed to get container process stat: {error}"
+                );
+                return Ok(());
+            }
+        };
+        if process.state.is_dead()
+            || self
+                .process_start_time
+                .is_some_and(|expected| expected != process.start_time)
+        {
+            self.status = RuntimeStatus::Stopped;
+        } else {
+            self.status = RuntimeStatus::Running;
         }
+        Ok(())
     }
+}
+
+fn default_runtime_status() -> RuntimeStatus {
+    RuntimeStatus::Creating
+}
+
+fn deserialize_process_start_time<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u64::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_created<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    normalize_created(&value).map_err(serde::de::Error::custom)
+}
+
+pub fn created_now() -> String {
+    format_created(Utc::now())
+}
+
+fn normalize_created(value: &str) -> Result<String> {
+    let datetime = if value.contains('T') || value.contains('-') {
+        if !value.ends_with(['Z', 'z']) {
+            bail!("expected 'Z' timezone");
+        }
+        let normalized;
+        let value = if let Some(value) = value.strip_suffix('z') {
+            normalized = format!("{value}Z");
+            normalized.as_str()
+        } else {
+            value
+        };
+        DateTime::parse_from_rfc3339(value)
+            .context("invalid ISO 8601 created time")?
+            .with_timezone(&Utc)
+    } else {
+        let nanoseconds = value
+            .parse::<u64>()
+            .context("invalid integer nanoseconds format")?;
+        let nanoseconds: i64 = nanoseconds
+            .try_into()
+            .context("nanoseconds value out of range")?;
+        DateTime::<Utc>::from_timestamp(
+            nanoseconds.div_euclid(1_000_000_000),
+            nanoseconds.rem_euclid(1_000_000_000) as u32,
+        )
+        .context("date time out of representable range")?
+    };
+    Ok(format_created(datetime))
+}
+
+fn format_created(datetime: DateTime<Utc>) -> String {
+    datetime.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 pub fn validate_id(id: &str) -> Result<()> {
@@ -92,7 +189,11 @@ pub fn write_status(root: &Path, status: &Status) -> Result<()> {
     let directory = root.join(&status.id);
     fs::create_dir_all(&directory)
         .with_context(|| format!("failed to create status directory {}", directory.display()))?;
-    let value = serde_json::to_value(status)?;
+    let mut value = serde_json::to_value(status)?;
+    value
+        .as_object_mut()
+        .expect("Status serializes as an object")
+        .remove("status");
     atomic_write(&directory.join("status.json"), &serde_json::to_vec(&value)?)
 }
 
@@ -151,7 +252,25 @@ pub fn remove_status_directory(root: &Path, id: &str) -> Result<()> {
 pub fn load_status(path: &Path) -> Result<Status> {
     let content = fs::read(path)
         .with_context(|| format!("failed to open status file: {}", path.display()))?;
-    let mut status: Status = serde_json::from_slice(&content)
+    let mut value = strict_json::value_from_slice(&content)
+        .with_context(|| format!("failed to parse status file: {}", path.display()))?;
+    let object = value
+        .as_object_mut()
+        .context("status file must contain an object")?;
+    if let Some(pid) = object.get_mut("pid") {
+        let normalized =
+            strict_json::as_i32(pid).context("status pid must be an in-range integer")?;
+        *pid = serde_json::Value::from(normalized);
+    }
+    if let Some(start_time) = object
+        .get_mut("process-start-time")
+        .filter(|value| !value.is_null())
+    {
+        let normalized = strict_json::as_u64(start_time)
+            .context("process-start-time must be an unsigned integer")?;
+        *start_time = serde_json::Value::from(normalized);
+    }
+    let mut status: Status = serde_json::from_value(value)
         .with_context(|| format!("failed to parse status file: {}", path.display()))?;
     status.refresh_liveness()?;
     Ok(status)
@@ -177,10 +296,7 @@ pub fn list_statuses(root: &Path) -> Result<Vec<Status>> {
 pub fn print_statuses(statuses: &[Status], format: ListFormat) -> Result<()> {
     match format {
         ListFormat::Json => {
-            let values = statuses
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let values = statuses.iter().map(oci_status_value).collect::<Vec<_>>();
             let mut output = io::stdout().lock();
             let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
             let mut serializer = serde_json::Serializer::with_formatter(&mut output, formatter);
@@ -208,7 +324,7 @@ fn print_table(statuses: &[Status]) -> Result<()> {
         "STATUS",
         "BUNDLE PATH",
         "CREATED",
-        name_width = width + 1
+        name_width = width
     )?;
     for status in statuses {
         writeln!(
@@ -240,6 +356,20 @@ fn quoted_path(path: &Path) -> String {
     quoted.push('"');
     quoted
 }
+
+fn oci_status_value(status: &Status) -> serde_json::Value {
+    serde_json::json!({
+        "id": status.id,
+        "pid": status.pid,
+        "status": status_name(status.status),
+        "bundle": status.bundle,
+        "created": status.created,
+        "owner": status.owner,
+        "annotations": status.annotations,
+        "ociVersion": status.oci_version,
+    })
+}
+
 pub fn status_name(status: RuntimeStatus) -> &'static str {
     match status {
         RuntimeStatus::Creating => "creating",
@@ -252,23 +382,26 @@ pub fn status_name(status: RuntimeStatus) -> &'static str {
 fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path.parent().context("status path has no parent")?;
     fs::create_dir_all(parent)?;
-    let mut temporary_name = path.as_os_str().to_os_string();
-    temporary_name.push(".tmp");
-    let temporary_path = PathBuf::from(temporary_name);
-    let result = (|| -> io::Result<()> {
-        let mut temporary = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temporary_path)?;
-        temporary.write_all(content)?;
-        drop(temporary);
-        fs::rename(&temporary_path, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result.with_context(|| format!("failed to atomically write status file: {}", path.display()))
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".tmp-")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "failed to create temporary status file in {}",
+                parent.display()
+            )
+        })?;
+    temporary
+        .as_file_mut()
+        .set_permissions(fs::Permissions::from_mode(0o700))?;
+    temporary.as_file_mut().write_all(content)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to atomically write status file: {}", path.display()))?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -286,20 +419,78 @@ mod tests {
     }
 
     #[test]
-    fn uses_oci_compatible_field_names() {
+    fn separates_persistent_and_oci_status_fields() {
         let status = Status {
             id: "demo".to_string(),
             pid: 0,
+            process_start_time: Some(123),
             status: RuntimeStatus::Stopped,
             bundle: PathBuf::from("/bundle"),
-            created: "1".to_string(),
+            created: "1970-01-01T00:00:00.000000Z".to_string(),
             owner: "tester".to_string(),
             annotations: BTreeMap::new(),
             oci_version: OCI_VERSION.to_string(),
         };
-        let value = serde_json::to_value(status).unwrap();
+        let value = oci_status_value(&status);
         assert_eq!(value["ociVersion"], OCI_VERSION);
         assert_eq!(value["status"], "stopped");
+        assert!(value.get("process-start-time").is_none());
+
+        let temporary = tempfile::tempdir().unwrap();
+        write_status(temporary.path(), &status).unwrap();
+        let value = strict_json::value_from_slice(
+            &fs::read(temporary.path().join("demo/status.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(value.get("status").is_none());
+        assert_eq!(value["process-start-time"], 123);
+    }
+
+    #[test]
+    fn legacy_status_omits_missing_process_start_time() {
+        let mut value = serde_json::json!({
+            "id": "demo",
+            "pid": 1,
+            "status": "running",
+            "bundle": "/bundle",
+            "created": "1",
+            "owner": "tester",
+            "annotations": {},
+            "ociVersion": OCI_VERSION
+        });
+        let status: Status = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(status.process_start_time, None);
+        assert_eq!(status.created, "1970-01-01T00:00:00.000000Z");
+        assert!(
+            serde_json::to_value(status)
+                .unwrap()
+                .get("process-start-time")
+                .is_none()
+        );
+
+        value["process-start-time"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Status>(value).is_err());
+    }
+
+    #[test]
+    fn status_load_accepts_integral_floats_but_rejects_narrowing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("status.json");
+        fs::write(
+            &path,
+            br#"{"id":"demo","pid":0.0,"process-start-time":5.0,"bundle":"/bundle","created":"0","owner":"tester","annotations":{},"ociVersion":"1.3.0"}"#,
+        )
+        .unwrap();
+        let status = load_status(&path).unwrap();
+        assert_eq!(status.pid, 0);
+        assert_eq!(status.process_start_time, Some(5));
+
+        fs::write(
+            &path,
+            br#"{"id":"demo","pid":2147483648,"bundle":"/bundle","created":"0","owner":"tester","annotations":{},"ociVersion":"1.3.0"}"#,
+        )
+        .unwrap();
+        assert!(load_status(&path).is_err());
     }
 
     #[test]

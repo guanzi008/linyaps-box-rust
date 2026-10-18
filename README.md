@@ -1,9 +1,9 @@
 # linyaps-box-rust
 
-`OpenAtom-Linyaps/linyaps-box` 的纯 Rust、命令兼容 OCI 运行时重构。兼容目标冻结在上游提交
-[`2f6023b609f500b756b558bf0b87be4e504c53f5`](https://github.com/OpenAtom-Linyaps/linyaps-box/commit/2f6023b609f500b756b558bf0b87be4e504c53f5)，版本输出保持 `2.3.0-dev-` 和 OCI spec `1.3.0`。
+`OpenAtom-Linyaps/linyaps-box` 的纯 Rust、命令兼容 OCI 运行时重构。兼容目标同步到上游提交
+[`ca5e503ea72553f65b3e4e4bfe86c707eeeb63ea`](https://github.com/OpenAtom-Linyaps/linyaps-box/commit/ca5e503ea72553f65b3e4e4bfe86c707eeeb63ea)，版本输出保持 `2.4.0-dev-` 和 OCI spec `1.3.0`。
 
-`ll-box` 保留冻结版本的 `run`、`exec`、`kill`、`list` 命令、参数、错误文本、状态文件、表格/JSON、console socket、hook 和信号语义。容器生命周期基于仓库内 vendored Youki `libcontainer` Rust 实现，不调用原 C++ 二进制，也不包含 C、C++、Go、Python 或汇编实现源码。
+`ll-box` 保留对应上游版本的 `run`、`exec`、`kill`、`list` 命令、参数、错误文本、状态文件、表格/JSON、console socket、hook 和信号语义。容器生命周期基于仓库内 vendored Youki `libcontainer` Rust 实现，不调用原 C++ 二进制，也不包含 C、C++、Go、Python 或汇编实现源码。
 
 完整行为范围和冻结约束见 [`COMPATIBILITY.md`](COMPATIBILITY.md)。
 

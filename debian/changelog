@@ -1,3 +1,10 @@
+linyaps-box-rust (2.4.0~rust1-1) unstable; urgency=medium
+
+  * Synchronize runtime behavior with linyaps-box 2.4.0.
+  * Harden JSON, process identity, OCI status, and configuration validation.
+
+ -- guanzi008 <20619190+guanzi008@users.noreply.github.com>  Sun, 18 Oct 2026 18:00:00 +0800
+
 linyaps-box-rust (2.3.0~rust1-3) unstable; urgency=medium
 
   * Rebuild the Rust OCI runtime for the final Deepin 23 and 25 set.

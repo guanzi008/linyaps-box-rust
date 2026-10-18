@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::OCI_VERSION;
 use crate::capability;
+use crate::strict_json;
 
 const COPY_SYMLINK: &str = "copy-symlink";
 const NS_LAST_PID_ANNOTATION: &str = "cn.org.linyaps.runtime.ns_last_pid";
@@ -73,7 +74,7 @@ impl PreparedBundle {
                 config_path.display()
             )
         })?;
-        let mut value: Value = serde_json::from_slice(&original_config)
+        let mut value: Value = strict_json::value_from_slice(&original_config)
             .with_context(|| format!("cannot parse config file: {}", config_path.display()))?;
         validate_required_fields(&value)?;
         validate_config(&value)?;
@@ -170,7 +171,7 @@ impl PreparedBundle {
 
     pub fn set_hook_state_metadata(&mut self, created: &str, owner: &str) -> Result<()> {
         let path = self.directory.path().join("config.json");
-        let mut value: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let mut value: Value = strict_json::value_from_slice(&fs::read(&path)?)?;
         let annotations = value
             .as_object_mut()
             .context("OCI config must be an object")?
@@ -224,13 +225,35 @@ fn validate_required_fields(value: &Value) -> Result<()> {
         .context("ociVersion is required")?;
     let requested = parse_oci_version(version)?;
     let supported = parse_oci_version(OCI_VERSION).expect("OCI_VERSION must be valid semver");
-    if requested.0 != supported.0 || requested > supported {
+    if requested.major != supported.major || requested > supported {
         bail!("unsupported OCI version: {version}");
     }
     Ok(())
 }
 
-fn parse_oci_version(version: &str) -> Result<(u32, u32, u32)> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OciVersion {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    prerelease: Vec<String>,
+}
+
+impl Ord for OciVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| compare_prerelease(&self.prerelease, &other.prerelease))
+    }
+}
+
+impl PartialOrd for OciVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn parse_oci_version(version: &str) -> Result<OciVersion> {
     let core_end = version.find(['-', '+']).unwrap_or(version.len());
     let mut core = version[..core_end].split('.');
     let major = parse_oci_version_segment(version, core.next())?;
@@ -240,26 +263,33 @@ fn parse_oci_version(version: &str) -> Result<(u32, u32, u32)> {
         bail!("invalid semver: {version}");
     }
 
+    let mut prerelease = Vec::new();
     if core_end < version.len() {
         let suffix = &version[core_end..];
         if let Some(build) = suffix.strip_prefix('+') {
-            validate_oci_version_identifiers(version, build)?;
+            validate_oci_version_identifiers(version, build, false)?;
         } else if let Some(prerelease_and_build) = suffix.strip_prefix('-') {
-            let (prerelease, build) = prerelease_and_build
+            let (prerelease_text, build) = prerelease_and_build
                 .split_once('+')
                 .map_or((prerelease_and_build, None), |(prerelease, build)| {
                     (prerelease, Some(build))
                 });
-            validate_oci_version_identifiers(version, prerelease)?;
+            validate_oci_version_identifiers(version, prerelease_text, true)?;
+            prerelease = prerelease_text.split('.').map(str::to_string).collect();
             if let Some(build) = build {
-                validate_oci_version_identifiers(version, build)?;
+                validate_oci_version_identifiers(version, build, false)?;
             }
         } else {
             bail!("invalid semver: {version}");
         }
     }
 
-    Ok((major, minor, patch))
+    Ok(OciVersion {
+        major,
+        minor,
+        patch,
+        prerelease,
+    })
 }
 
 fn parse_oci_version_segment(version: &str, segment: Option<&str>) -> Result<u32> {
@@ -272,16 +302,16 @@ fn parse_oci_version_segment(version: &str, segment: Option<&str>) -> Result<u32
     {
         bail!("invalid semver: {version}");
     }
-    let value = segment
+    segment
         .parse::<u32>()
-        .with_context(|| format!("invalid semver: {version}"))?;
-    if value > i32::MAX as u32 {
-        bail!("invalid semver: {version}");
-    }
-    Ok(value)
+        .with_context(|| format!("invalid semver: {version}"))
 }
 
-fn validate_oci_version_identifiers(version: &str, identifiers: &str) -> Result<()> {
+fn validate_oci_version_identifiers(
+    version: &str,
+    identifiers: &str,
+    numeric_no_leading_zero: bool,
+) -> Result<()> {
     if identifiers.is_empty() {
         bail!("invalid semver: {version}");
     }
@@ -290,7 +320,8 @@ fn validate_oci_version_identifiers(version: &str, identifiers: &str) -> Result<
             || !identifier
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            || (identifier.len() > 1
+            || (numeric_no_leading_zero
+                && identifier.len() > 1
                 && identifier.starts_with('0')
                 && identifier.bytes().all(|byte| byte.is_ascii_digit()))
         {
@@ -300,10 +331,40 @@ fn validate_oci_version_identifiers(version: &str, identifiers: &str) -> Result<
     Ok(())
 }
 
+fn compare_prerelease(left: &[String], right: &[String]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+    for (left, right) in left.iter().zip(right) {
+        let left_numeric = left.bytes().all(|byte| byte.is_ascii_digit());
+        let right_numeric = right.bytes().all(|byte| byte.is_ascii_digit());
+        let ordering = match (left_numeric, right_numeric) {
+            (true, true) => left.len().cmp(&right.len()).then_with(|| left.cmp(right)),
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => left.cmp(right),
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
 fn validate_config(value: &Value) -> Result<()> {
     value.as_object().context("OCI config must be an object")?;
     for field in ["hostname", "domainname"] {
         validate_optional_string(value, field, field)?;
+        if value.get(field).is_some_and(|value| !value.is_null())
+            && !has_linux_namespace(value, "uts")
+        {
+            bail!("{field} requires the UTS namespace");
+        }
     }
     if let Some(process) = value.get("process").filter(|value| !value.is_null()) {
         let process = process.as_object().context("process must be an object")?;
@@ -409,6 +470,17 @@ fn validate_optional_string(value: &Value, field: &str, display: &str) -> Result
     Ok(())
 }
 
+fn has_linux_namespace(value: &Value, kind: &str) -> bool {
+    value
+        .pointer("/linux/namespaces")
+        .and_then(Value::as_array)
+        .is_some_and(|namespaces| {
+            namespaces
+                .iter()
+                .any(|namespace| namespace.get("type").and_then(Value::as_str) == Some(kind))
+        })
+}
+
 fn validate_process_noop_fields(process: &serde_json::Map<String, Value>) -> Result<()> {
     validate_scheduler(process)?;
     validate_io_priority(process)?;
@@ -496,70 +568,23 @@ fn validate_i32(value: &Value, display: &str) -> Result<i32> {
 }
 
 fn cpp_number_as_u64(value: &Value) -> Option<u64> {
-    let number = value.as_number()?;
-    if let Some(value) = number.as_i64() {
-        return Some(value as u64);
-    }
-    if let Some(value) = number.as_u64() {
-        return Some(value);
-    }
-    let value = number.as_f64()?;
-    if !value.is_finite() {
-        return Some(0);
-    }
-    if value >= 0.0 {
-        if value < 18_446_744_073_709_551_616.0 {
-            Some(value.trunc() as u64)
-        } else {
-            Some(0)
-        }
-    } else if value >= -9_223_372_036_854_775_808.0 {
-        Some((value.trunc() as i64) as u64)
-    } else {
-        Some(0)
-    }
+    strict_json::as_u64(value)
 }
 
 fn cpp_number_as_u32(value: &Value) -> Option<u32> {
-    cpp_number_as_u64(value).map(|value| value as u32)
+    strict_json::as_u32(value)
 }
 
 fn cpp_number_as_u16(value: &Value) -> Option<u16> {
-    cpp_number_as_u64(value).map(|value| value as u16)
+    strict_json::as_u16(value)
 }
 
 fn cpp_number_as_i64(value: &Value) -> Option<i64> {
-    let number = value.as_number()?;
-    if let Some(value) = number.as_i64() {
-        return Some(value);
-    }
-    if let Some(value) = number.as_u64() {
-        return Some(value as i64);
-    }
-    let value = number.as_f64()?;
-    if value.is_finite()
-        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value)
-    {
-        Some(value.trunc() as i64)
-    } else {
-        Some(i64::MIN)
-    }
+    strict_json::as_i64(value)
 }
 
 fn cpp_number_as_i32(value: &Value) -> Option<i32> {
-    let number = value.as_number()?;
-    if let Some(value) = number.as_i64() {
-        return Some(value as i32);
-    }
-    if let Some(value) = number.as_u64() {
-        return Some(value as i32);
-    }
-    let value = number.as_f64()?;
-    if value.is_finite() && (-2_147_483_648.0..2_147_483_648.0).contains(&value) {
-        Some(value.trunc() as i32)
-    } else {
-        Some(i32::MIN)
-    }
+    strict_json::as_i32(value)
 }
 
 fn validate_console_size(process: &serde_json::Map<String, Value>) -> Result<()> {
@@ -1126,11 +1151,9 @@ fn validate_resource_cpu(cpu: Option<&Value>) -> Result<()> {
     }
     for field in ["cpus", "mems"] {
         if let Some(value) = cpu.get(field).filter(|value| !value.is_null()) {
-            validate_range_list(
-                value
-                    .as_str()
-                    .with_context(|| format!("linux.resources.cpu.{field} must be a string"))?,
-            )?;
+            value
+                .as_str()
+                .with_context(|| format!("linux.resources.cpu.{field} must be a string"))?;
         }
     }
     let quota = cpu.get("quota").and_then(cpp_number_as_i64);
@@ -1389,89 +1412,90 @@ fn validate_memory_policy(policy: Option<&Value>) -> Result<()> {
     ) {
         bail!("unknown value: {mode}");
     }
-    if let Some(nodes) = policy.get("nodes").filter(|value| !value.is_null()) {
-        validate_range_list(
+    let nodes = policy
+        .get("nodes")
+        .filter(|value| !value.is_null())
+        .map(|nodes| {
             nodes
                 .as_str()
-                .context("linux.memoryPolicy.nodes must be a string")?,
-        )?;
-    }
-    if let Some(flags) = policy.get("flags").filter(|value| !value.is_null()) {
-        for flag in
-            nlohmann_string_values(flags, "linux.memoryPolicy.flags entries must be strings")?
-        {
+                .context("linux.memoryPolicy.nodes must be a string")
+        })
+        .transpose()?;
+    let flags = if let Some(flags) = policy.get("flags").filter(|value| !value.is_null()) {
+        let flags =
+            nlohmann_string_values(flags, "linux.memoryPolicy.flags entries must be strings")?;
+        for flag in &flags {
             if !matches!(
-                flag,
+                *flag,
                 "MPOL_F_NUMA_BALANCING" | "MPOL_F_RELATIVE_NODES" | "MPOL_F_STATIC_NODES"
             ) {
                 bail!("unknown value: {flag}");
             }
         }
-    }
-    Ok(())
-}
+        flags
+    } else {
+        Vec::new()
+    };
 
-fn validate_range_list(value: &str) -> Result<()> {
-    if value.is_empty() {
-        return Ok(());
+    let has_static = flags.contains(&"MPOL_F_STATIC_NODES");
+    let has_relative = flags.contains(&"MPOL_F_RELATIVE_NODES");
+    let has_balancing = flags.contains(&"MPOL_F_NUMA_BALANCING");
+    if has_static && has_relative {
+        bail!(
+            "memoryPolicy flags MPOL_F_STATIC_NODES and MPOL_F_RELATIVE_NODES are mutually exclusive"
+        );
     }
-    let entries = value.split(',').collect::<Vec<_>>();
-    for (index, entry) in entries.iter().enumerate() {
-        let entry = entry.trim_ascii();
-        if entry.is_empty() && index + 1 == entries.len() {
-            continue;
-        }
-        let (start, finish) = entry
-            .split_once('-')
-            .map_or((entry, None), |(start, finish)| {
-                (start.trim_ascii(), Some(finish.trim_ascii()))
-            });
-        let start = parse_range_number(start, "value", entry)?;
-        if let Some(finish) = finish {
-            let finish = parse_range_number(finish, "range end", entry)?;
-            if finish < start {
-                bail!("invalid range in range list (finish < start) at: {entry}");
-            }
-            if start == 0 && finish == u32::MAX {
-                bail!("range too large in range list at: {entry}");
-            }
-        }
+    if has_balancing && !matches!(mode, "MPOL_BIND" | "MPOL_PREFERRED_MANY") {
+        bail!("memoryPolicy flag MPOL_F_NUMA_BALANCING requires MPOL_BIND or MPOL_PREFERRED_MANY");
     }
-    Ok(())
-}
 
-fn parse_range_number(value: &str, kind: &str, entry: &str) -> Result<u32> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        bail!("invalid {kind} in range list at: {entry}");
+    let has_nodes = nodes.is_some_and(|nodes| {
+        nodes
+            .bytes()
+            .any(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b','))
+    });
+    match mode {
+        "MPOL_DEFAULT" if has_nodes => {
+            bail!("memoryPolicy mode MPOL_DEFAULT must not specify nodes")
+        }
+        "MPOL_LOCAL" if has_nodes || has_static || has_relative => {
+            bail!("memoryPolicy mode MPOL_LOCAL accepts neither nodes nor static/relative flags")
+        }
+        "MPOL_PREFERRED" if !has_nodes && (has_static || has_relative) => {
+            bail!("memoryPolicy mode MPOL_PREFERRED with empty nodes rejects static/relative flags")
+        }
+        "MPOL_BIND" | "MPOL_INTERLEAVE" | "MPOL_PREFERRED_MANY" | "MPOL_WEIGHTED_INTERLEAVE"
+            if !has_nodes =>
+        {
+            bail!(
+                "memoryPolicy mode MPOL_BIND/MPOL_INTERLEAVE/MPOL_PREFERRED_MANY/MPOL_WEIGHTED_INTERLEAVE requires at least one node"
+            )
+        }
+        _ => Ok(()),
     }
-    value
-        .parse::<u32>()
-        .with_context(|| format!("{kind} overflow in range list at: {entry}"))
 }
 
 fn validate_time_offsets(offsets: Option<&Value>) -> Result<()> {
     let Some(offsets) = offsets.filter(|value| !value.is_null()) else {
         return Ok(());
     };
-    let values = match offsets {
-        Value::Object(offsets) => offsets.values().collect::<Vec<_>>(),
-        Value::Array(offsets) => offsets.iter().collect::<Vec<_>>(),
-        _ => vec![offsets],
-    };
-    for offset in values {
+    let offsets = offsets
+        .as_object()
+        .context("linux.timeOffsets must be an object")?;
+    for offset in offsets.values() {
         let offset = offset
             .as_object()
             .context("linux.timeOffsets entries must be objects")?;
-        offset
-            .get("secs")
-            .and_then(cpp_number_as_i64)
-            .context("linux.timeOffsets.secs must be an integer")?;
-        cpp_number_as_u32(
-            offset
-                .get("nanosecs")
-                .context("linux.timeOffsets.nanosecs is required")?,
-        )
-        .context("linux.timeOffsets.nanosecs must be an unsigned integer")?;
+        if let Some(secs) = offset.get("secs").filter(|value| !value.is_null()) {
+            cpp_number_as_i64(secs).context("linux.timeOffsets.secs must be an integer")?;
+        }
+        if let Some(nanosecs) = offset.get("nanosecs").filter(|value| !value.is_null()) {
+            let nanosecs = cpp_number_as_u32(nanosecs)
+                .context("linux.timeOffsets.nanosecs must be an unsigned integer")?;
+            if nanosecs >= 1_000_000_000 {
+                bail!("timeOffsets nanosecs must be smaller than 1000000000");
+            }
+        }
     }
     Ok(())
 }
@@ -1512,8 +1536,6 @@ fn validate_intel_rdt(intel_rdt: Option<&Value>) -> Result<()> {
 fn strip_upstream_noop_fields(value: &mut Value) {
     normalize_cpp_numeric_fields(value);
     value.as_object_mut().into_iter().for_each(|object| {
-        object.remove("hostname");
-        object.remove("domainname");
         if object.get("linux").is_none_or(|value| !value.is_object()) {
             object.insert("linux".to_string(), Value::Object(Default::default()));
         }
@@ -2501,7 +2523,7 @@ fn owned_fd(raw: std::os::fd::RawFd) -> OwnedFd {
 }
 
 pub fn process_uses_terminal(path: &Path) -> Result<bool> {
-    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let value: Value = strict_json::value_from_slice(&fs::read(path)?)?;
     let process = value.get("process").unwrap_or(&value);
     Ok(process
         .get("terminal")
@@ -2509,7 +2531,7 @@ pub fn process_uses_terminal(path: &Path) -> Result<bool> {
 }
 
 pub fn process_console_size(path: &Path) -> Result<Option<(u16, u16)>> {
-    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let value: Value = strict_json::value_from_slice(&fs::read(path)?)?;
     let process = value.get("process").unwrap_or(&value);
     if process.get("terminal").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
@@ -2794,7 +2816,7 @@ mod tests {
         });
         assert!(validate_config(&value).is_err());
 
-        for version in ["1.3.0+001", "1.3.0-01", "2147483648.0.0", "1.3.0-alpha+"] {
+        for version in ["1.3.0-01", "2147483648.0.0", "1.3.0-alpha+"] {
             let value = serde_json::json!({
                 "ociVersion": version,
                 "process": {"cwd": "/", "args": ["true"]},
@@ -2803,7 +2825,12 @@ mod tests {
             assert!(validate_required_fields(&value).is_err(), "{version}");
         }
 
-        for version in ["1.2.999999-alpha", "1.3.0-alpha", "1.3.0+build"] {
+        for version in [
+            "1.2.999999-alpha",
+            "1.3.0-alpha",
+            "1.3.0+build",
+            "1.3.0+001",
+        ] {
             let value = serde_json::json!({
                 "ociVersion": version,
                 "process": {"cwd": "/", "args": ["true"]},
@@ -2837,10 +2864,12 @@ mod tests {
             "0.0.0",
             "1.2.3",
             "2147483647.0.0",
+            "4294967295.0.0",
             "1.2.3-alpha",
             "1.2.3-alpha.1",
             "1.2.3-0",
             "1.2.3+build-1",
+            "1.2.3+001",
             "1.2.3-alpha+build",
         ] {
             parse_oci_version(version).unwrap_or_else(|error| panic!("{version}: {error}"));
@@ -2856,18 +2885,30 @@ mod tests {
             "-1.2.3",
             "1.-2.3",
             "1.2.-3",
-            "2147483648.0.0",
+            "4294967296.0.0",
             "1.2.3-",
             "1.2.3+",
             "1.2.3-alpha.",
             "1.2.3-.alpha",
             "1.2.3-01",
-            "1.2.3+001",
             "1.2.3-alpha_beta",
             "1.2.3-alpha+build+extra",
         ] {
             assert!(parse_oci_version(version).is_err(), "{version}");
         }
+    }
+
+    #[test]
+    fn compares_semver_prerelease_without_integer_overflow() {
+        assert!(parse_oci_version("1.3.0-alpha").unwrap() < parse_oci_version("1.3.0").unwrap());
+        assert!(
+            parse_oci_version("1.3.0-99999999999999999999").unwrap()
+                > parse_oci_version("1.3.0-2").unwrap()
+        );
+        assert!(
+            parse_oci_version("1.3.0-alpha.1").unwrap()
+                < parse_oci_version("1.3.0-alpha.beta").unwrap()
+        );
     }
 
     #[test]
@@ -2952,7 +2993,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_then_strips_upstream_noop_oci_fields() {
+    fn preserves_uts_names_while_stripping_unsupported_oci_fields() {
         let mut value = serde_json::json!({
             "hostname": "ignored-host",
             "domainname": "ignored-domain",
@@ -2970,7 +3011,10 @@ mod tests {
                 "execCPUAffinity": {"initial": "0-1", "final": "2"}
             },
             "linux": {
-                "namespaces": [{"type": "pid", "path": "/proc/1/ns/pid"}],
+                "namespaces": [
+                    {"type": "pid", "path": "/proc/1/ns/pid"},
+                    {"type": "uts", "path": "/proc/1/ns/uts"}
+                ],
                 "devices": [{"type": "c", "path": "/dev/demo"}],
                 "netDevices": {"eth0": {"name": "inside0"}},
                 "cgroupsPath": "/ignored",
@@ -2996,8 +3040,8 @@ mod tests {
         validate_config(&value).unwrap();
         strip_upstream_noop_fields(&mut value);
 
-        assert!(value.get("hostname").is_none());
-        assert!(value.get("domainname").is_none());
+        assert_eq!(value["hostname"], "ignored-host");
+        assert_eq!(value["domainname"], "ignored-domain");
         assert_eq!(value["process"]["terminal"], true);
         assert_eq!(value["process"]["noNewPrivileges"], true);
         assert_eq!(
@@ -3029,7 +3073,13 @@ mod tests {
         ] {
             assert!(value["linux"].get(field).is_none(), "field {field}");
         }
-        assert!(value["linux"]["namespaces"][0].get("path").is_none());
+        assert!(
+            value["linux"]["namespaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|namespace| namespace.get("path").is_none())
+        );
     }
 
     #[test]
@@ -3087,7 +3137,7 @@ mod tests {
             }),
             serde_json::json!({
                 "process": {"cwd": "/", "args": ["true"]},
-                "linux": {"memoryPolicy": {"mode": "MPOL_BIND", "nodes": "2-1"}}
+                "linux": {"memoryPolicy": {"mode": "MPOL_BIND"}}
             }),
             serde_json::json!({
                 "process": {"cwd": "/", "args": ["true"], "scheduler": {
@@ -3096,7 +3146,7 @@ mod tests {
             }),
             serde_json::json!({
                 "process": {"cwd": "/", "args": ["true"]},
-                "linux": {"resources": {"cpu": {"cpus": "+1"}}}
+                "linux": {"resources": {"cpu": {"cpus": 42}}}
             }),
             serde_json::json!({
                 "process": {"cwd": "/", "args": ["true"]},
@@ -3104,6 +3154,101 @@ mod tests {
             }),
         ] {
             assert!(validate_config(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn keeps_cpu_and_node_lists_verbatim() {
+        for cpus in ["", "   ", "0-3,7", "1,,2", "1-4294967294", "+1"] {
+            let value = serde_json::json!({
+                "process": {"cwd": "/", "args": ["true"]},
+                "linux": {"resources": {"cpu": {"cpus": cpus, "mems": cpus}}}
+            });
+            validate_config(&value).unwrap_or_else(|error| panic!("{cpus}: {error}"));
+        }
+        for nodes in ["", "   ", ", ,", "0-3,7", "all", "1-123456789123456789"] {
+            let value = serde_json::json!({
+                "process": {"cwd": "/", "args": ["true"]},
+                "linux": {"memoryPolicy": {"mode": "MPOL_PREFERRED", "nodes": nodes}}
+            });
+            validate_config(&value).unwrap_or_else(|error| panic!("{nodes}: {error}"));
+        }
+    }
+
+    #[test]
+    fn validates_memory_policy_mode_and_flags() {
+        for value in [
+            serde_json::json!({"mode": "MPOL_DEFAULT", "nodes": "0"}),
+            serde_json::json!({"mode": "MPOL_LOCAL", "nodes": "0"}),
+            serde_json::json!({"mode": "MPOL_BIND", "nodes": " , "}),
+            serde_json::json!({
+                "mode": "MPOL_BIND",
+                "nodes": "0",
+                "flags": ["MPOL_F_STATIC_NODES", "MPOL_F_RELATIVE_NODES"]
+            }),
+            serde_json::json!({
+                "mode": "MPOL_PREFERRED",
+                "nodes": "0",
+                "flags": ["MPOL_F_NUMA_BALANCING"]
+            }),
+        ] {
+            assert!(validate_memory_policy(Some(&value)).is_err(), "{value}");
+        }
+        validate_memory_policy(Some(&serde_json::json!({
+            "mode": "MPOL_PREFERRED",
+            "nodes": " , "
+        })))
+        .unwrap();
+    }
+
+    #[test]
+    fn validates_time_offset_optional_fields_and_nanosecond_bound() {
+        for value in [
+            serde_json::json!({"monotonic": {}}),
+            serde_json::json!({"monotonic": {"secs": -5}}),
+            serde_json::json!({"monotonic": {"nanosecs": 999_999_999}}),
+        ] {
+            validate_time_offsets(Some(&value)).unwrap();
+        }
+        assert!(
+            validate_time_offsets(Some(
+                &serde_json::json!({"monotonic": {"nanosecs": 1_000_000_000}})
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_integer_conversion_rejects_narrowing_and_fractional_values() {
+        assert_eq!(cpp_number_as_u32(&serde_json::json!(255)), Some(255));
+        assert_eq!(cpp_number_as_i64(&serde_json::json!(5.0)), Some(5));
+        assert_eq!(cpp_number_as_u32(&serde_json::json!(-1)), None);
+        assert_eq!(
+            cpp_number_as_u32(&serde_json::json!(4_294_967_296_u64)),
+            None
+        );
+        assert_eq!(
+            cpp_number_as_i32(&serde_json::json!(2_147_483_648_u64)),
+            None
+        );
+        assert_eq!(cpp_number_as_i64(&serde_json::json!(1.5)), None);
+    }
+
+    #[test]
+    fn hostname_and_domainname_require_uts_namespace() {
+        for field in ["hostname", "domainname"] {
+            let mut value = serde_json::json!({
+                "process": {"cwd": "/", "args": ["true"]}
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), Value::String("container".to_string()));
+            assert!(validate_config(&value).is_err());
+            value["linux"] = serde_json::json!({"namespaces": [{"type": "uts"}]});
+            validate_config(&value).unwrap();
+            strip_upstream_noop_fields(&mut value);
+            assert_eq!(value[field], "container");
         }
     }
 

@@ -5,7 +5,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use libc::c_char;
-use nix::sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, send, socketpair};
 use nix::unistd::Pid;
 use oci_spec::runtime::{ContainerState as OciContainerState, Hook, State as OciState};
 
@@ -129,13 +128,7 @@ fn execute_hook(hook: &Hook, state: &[u8]) -> Result<()> {
         .collect::<Vec<_>>();
     let argument_pointers = null_terminated_pointers(&arguments);
     let environment_pointers = null_terminated_pointers(&environment);
-    let (hook_stdin, state_sender) = socketpair(
-        AddressFamily::Unix,
-        SockType::SeqPacket,
-        None,
-        SockFlag::SOCK_CLOEXEC,
-    )
-    .map_err(nix_error)?;
+    let (hook_stdin, state_sender) = state_pipe()?;
     let (exec_error_reader, exec_error_writer) = exec_error_pipe()?;
 
     let pid = unsafe { libc::fork() };
@@ -168,7 +161,7 @@ fn execute_hook(hook: &Hook, state: &[u8]) -> Result<()> {
 
     drop(exec_error_writer);
     drop(hook_stdin);
-    if let Err(error) = send(state_sender.as_raw_fd(), state, MsgFlags::empty()) {
+    if let Err(error) = write_state(state_sender.as_raw_fd(), state) {
         tracing::warn!(?error, "failed to write state to hook stdin");
     }
     drop(state_sender);
@@ -194,6 +187,34 @@ fn execute_hook(hook: &Hook, state: &[u8]) -> Result<()> {
     }
     if libc::WIFSIGNALED(status) {
         return Err(HookError::Killed(libc::WTERMSIG(status)));
+    }
+    Ok(())
+}
+
+fn state_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut descriptors = [-1; 2];
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(HookError::CommandExecute(std::io::Error::last_os_error()));
+    }
+    Ok(unsafe {
+        (
+            OwnedFd::from_raw_fd(descriptors[0]),
+            OwnedFd::from_raw_fd(descriptors[1]),
+        )
+    })
+}
+
+fn write_state(fd: RawFd, mut state: &[u8]) -> std::io::Result<()> {
+    while !state.is_empty() {
+        let written = unsafe { libc::write(fd, state.as_ptr().cast(), state.len()) };
+        if written == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        state = &state[written as usize..];
     }
     Ok(())
 }
@@ -315,10 +336,6 @@ fn null_terminated_pointers(values: &[CString]) -> Vec<*const c_char> {
         .map(|value| value.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect()
-}
-
-fn nix_error(error: nix::errno::Errno) -> HookError {
-    HookError::CommandExecute(std::io::Error::from_raw_os_error(error as i32))
 }
 
 #[cfg(test)]

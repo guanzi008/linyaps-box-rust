@@ -43,7 +43,7 @@ impl RootFS {
             cgroup_ns,
         };
 
-        if has_mount_namespace {
+        if has_mount_namespace || linux.rootfs_propagation().is_some() {
             let flags = rootfs_propagation(linux)?;
             self.syscall
                 .mount(None, Path::new("/"), None, flags, None)
@@ -55,7 +55,9 @@ impl RootFS {
                     );
                     err
                 })?;
+        }
 
+        if has_mount_namespace {
             mounter.make_parent_mount_private(rootfs)?;
             let root_mount = MountBuilder::default()
                 .source(rootfs)
@@ -92,9 +94,6 @@ impl RootFS {
         has_mount_namespace: bool,
     ) -> Result<bool> {
         tracing::debug!(?rootfs, "prepare rootfs");
-        if spec.mounts().as_ref().is_none_or(Vec::is_empty) {
-            return Ok(false);
-        }
         let linux = spec.linux().as_ref().ok_or(MissingSpecError::Linux)?;
 
         let mounter = self.mount_to_rootfs(linux, spec, rootfs, cgroup_ns, has_mount_namespace)?;

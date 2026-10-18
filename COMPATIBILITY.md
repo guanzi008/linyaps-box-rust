@@ -3,8 +3,8 @@
 ## 冻结目标
 
 - 上游仓库：[`OpenAtom-Linyaps/linyaps-box`](https://github.com/OpenAtom-Linyaps/linyaps-box)
-- 冻结提交：`2f6023b609f500b756b558bf0b87be4e504c53f5`
-- 对外版本：`2.3.0-dev-`
+- 冻结提交：`ca5e503ea72553f65b3e4e4bfe86c707eeeb63ea`
+- 对外版本：`2.4.0-dev-`
 - OCI state/spec 版本：`1.3.0`
 
 兼容判断以冻结提交的实际二进制、源码运行路径和状态格式为准。
@@ -17,7 +17,9 @@
 - 前台/后台运行、console socket、TTY、preserve-fds、信号转发、退出状态和清理。
 - OCI hook 状态扩展、执行顺序、超时、环境隔离及 poststop 容错。
 - `exec` 的 process JSON、用户、工作目录、环境、capability、TTY 和 namespace 进入。
-- 冻结状态文件、`list` 表格/JSON、`kill --all`、日志文本/JSON/syslog/journal 兼容输出。
+- 2.4 状态文件、`list` 表格/JSON、`kill --all`、日志文本/JSON/syslog/journal 兼容输出。
+- 严格 JSON 数字范围、重复键与 NUL 校验，RFC3339 状态时间及 PID 启动时间身份校验。
+- UTS hostname/domainname、原样 CPU/NUMA 列表及 timeOffsets 边界校验。
 - Linyaps 扩展：`ns_last_pid`、hook 元数据、默认 runtime 根目录及兼容错误转换。
 
 ## 冻结约束

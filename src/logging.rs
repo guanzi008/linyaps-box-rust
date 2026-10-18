@@ -281,17 +281,16 @@ where
 
 #[derive(Serialize)]
 struct JsonLogRecord<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "error_code", skip_serializing_if = "Option::is_none")]
     errno: Option<i32>,
+    #[serde(rename = "error_message", skip_serializing_if = "Option::is_none")]
+    error_text: Option<&'a str>,
     file: &'a str,
     function: &'a str,
     level: &'a str,
     line: u32,
-    #[serde(rename = "msg")]
     message: &'a str,
     pid: u32,
-    #[serde(rename = "strerror", skip_serializing_if = "Option::is_none")]
-    error_text: Option<&'a str>,
     time: &'a str,
 }
 
@@ -511,12 +510,17 @@ fn extract_journal_context(bytes: &[u8], format: LogFormat) -> JournalContext {
         && let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
     {
         return JournalContext {
-            message: value["msg"].as_str().unwrap_or_default().to_string(),
+            message: value["message"]
+                .as_str()
+                .or_else(|| value["msg"].as_str())
+                .unwrap_or_default()
+                .to_string(),
             file: value["file"].as_str().unwrap_or_default().to_string(),
             line: value["line"].as_u64().unwrap_or_default(),
             function: value["function"].as_str().unwrap_or_default().to_string(),
-            errno: value["errno"]
+            errno: value["error_code"]
                 .as_i64()
+                .or_else(|| value["errno"].as_i64())
                 .and_then(|value| value.try_into().ok()),
         };
     }
@@ -545,7 +549,12 @@ fn extract_message(bytes: &[u8], format: LogFormat) -> String {
     match format {
         LogFormat::Json => serde_json::from_slice::<serde_json::Value>(bytes)
             .ok()
-            .and_then(|value| value["msg"].as_str().map(str::to_string))
+            .and_then(|value| {
+                value["message"]
+                    .as_str()
+                    .or_else(|| value["msg"].as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| formatted.trim_end().to_string()),
         LogFormat::Text => formatted
             .split_once(":\n")
@@ -602,7 +611,7 @@ mod tests {
             "first\nsecond"
         );
         assert_eq!(
-            extract_message(b"{\"msg\":\"failure\"}\n", LogFormat::Json),
+            extract_message(b"{\"message\":\"failure\"}\n", LogFormat::Json),
             "failure"
         );
     }
@@ -629,7 +638,7 @@ mod tests {
         assert_eq!(text.errno, None);
 
         let json = extract_journal_context(
-            b"{\"msg\":\"denied\",\"file\":\"container.cpp\",\"line\":137,\"function\":\"run\",\"errno\":13}\n",
+            b"{\"message\":\"denied\",\"file\":\"container.cpp\",\"line\":137,\"function\":\"run\",\"error_code\":13}\n",
             LogFormat::Json,
         );
         assert_eq!(json.message, "denied");
@@ -711,7 +720,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&record).unwrap(),
-            "{\"errno\":13,\"file\":\"exec.cpp\",\"function\":\"run\",\"level\":\"ERROR\",\"line\":42,\"msg\":\"failure\",\"pid\":7,\"strerror\":\"Permission denied\",\"time\":\"1970-01-01T00:00:00.005000000Z\"}"
+            "{\"error_code\":13,\"error_message\":\"Permission denied\",\"file\":\"exec.cpp\",\"function\":\"run\",\"level\":\"ERROR\",\"line\":42,\"message\":\"failure\",\"pid\":7,\"time\":\"1970-01-01T00:00:00.005000000Z\"}"
         );
     }
 

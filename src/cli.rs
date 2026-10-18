@@ -13,7 +13,7 @@ use libcontainer::signal::Signal;
 use crate::OCI_VERSION;
 use crate::capability;
 
-const LINYAPS_BOX_VERSION: &str = "2.3.0-dev-";
+const LINYAPS_BOX_VERSION: &str = "2.4.0-dev-";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -528,7 +528,7 @@ fn help_text(command: Option<&str>) -> String {
     }
 }
 
-const ROOT_HELP: &str = "A simple OCI runtime implementation focused on desktop applications.\n\n\nll-box [OPTIONS] SUBCOMMAND\n\n\nOPTIONS:\n  -h,     --help              Print this help message and exit\n  -v,     --version           Display program version information and exit\n          --root TEXT [{root}]  \n                              Root directory for storage of container state\n          --cgroup-manager MANAGER:value in {cgroupfs->cgroupfs,systemd->systemd,disabled->disabled} OR {2,1,0} [0]  \n                              Cgroup manager to use\n          --log-level LEVEL:value in {fatal->0,error->1,warn->2,info->3,debug->4} OR {0,1,2,3,4} [2]  (Env:LINYAPS_BOX_LOG_LEVEL) \n                              Set log level (fatal/error/warn/info/debug)\n          --log-format FORMAT:value in {text->0,json->1} OR {0,1} [0]  \n                              Set log format: text (default) or json\n          --log SINK ...      Log destinations (stderr, [file:]PATH, syslog:ID, journald:ID)\n          --cee-syslog        Prefix syslog messages with @cee: when --log-format=json\n\nSUBCOMMANDS:\n  list                        List known containers\n  run                         Create and immediately start a container\n  exec                        Exec a command in a running container\n  kill                        Send the specified signal to the container init process\n";
+const ROOT_HELP: &str = "A simple OCI runtime implementation focused on desktop applications.\n\n\nll-box [OPTIONS] SUBCOMMAND\n\n\nOPTIONS:\n  -h,     --help              Print this help message and exit\n  -v,     --version           Display program version information and exit\n          --root TEXT [{root}]  \n                              Root directory for storage of container state\n          --cgroup-manager MANAGER:value in {cgroupfs->cgroupfs,systemd->systemd,disabled->disabled} OR {2,1,0} [0]  \n                              Cgroup manager to use\n          --log-level LEVEL:value in {fatal->0,error->1,warn->2,info->3,debug->4} OR {0,1,2,3,4} [2]  (Env:LINYAPS_BOX_LOG_LEVEL) \n                              Set log level (fatal/error/warn/info/debug)\n          --log-format FORMAT:value in {text->0,json->1} OR {0,1} [0]  (Env:LINYAPS_BOX_LOG_FORMAT) \n                              Set log format: text (default) or json\n          --log SINK ...      Log destinations (stderr, [file:]PATH, syslog:ID, journald:ID)  (Env:LINYAPS_BOX_LOG_DESTINATION) \n          --cee-syslog        Prefix syslog messages with @cee: when --log-format=json\n\nSUBCOMMANDS:\n  list                        List known containers\n  run                         Create and immediately start a container\n  exec                        Exec a command in a running container\n  kill                        Send the specified signal to the container init process\n";
 
 const LIST_HELP: &str = "List known containers\n\n\nll-box list [OPTIONS]\n\n\nOPTIONS:\n  -h,     --help              Print this help message and exit\n  -f,     --format FORMAT:value in {json->1,table->0} OR {1,0} [0]  \n                              Specify the output format\n";
 
@@ -610,10 +610,20 @@ pub struct GlobalOptions {
     )]
     pub log_level: LogLevel,
 
-    #[arg(long, value_enum, default_value_t = LogFormat::Text, ignore_case = true)]
+    #[arg(
+        long,
+        value_enum,
+        env = "LINYAPS_BOX_LOG_FORMAT",
+        default_value_t = LogFormat::Text,
+        ignore_case = true
+    )]
     pub log_format: LogFormat,
 
-    #[arg(long, value_parser = validate_log_sink)]
+    #[arg(
+        long,
+        env = "LINYAPS_BOX_LOG_DESTINATION",
+        value_parser = validate_log_sink
+    )]
     pub log: Vec<String>,
 
     #[arg(

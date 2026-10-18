@@ -482,19 +482,17 @@ fn wait_for_trace_signal() -> Result<()> {
 }
 
 fn set_process_security(process: &Process, syscall: &dyn Syscall) -> Result<()> {
-    let Some(capability_sets) = process.capabilities() else {
-        return Ok(());
-    };
+    if let Some(capability_sets) = process.capabilities() {
+        if let Some(bounding) = capability_sets.bounding() {
+            syscall
+                .set_capability(CapSet::Bounding, &capabilities::to_set(bounding))
+                .map_err(InitProcessError::SyscallOther)?;
+        }
 
-    if let Some(bounding) = capability_sets.bounding() {
         syscall
-            .set_capability(CapSet::Bounding, &capabilities::to_set(bounding))
+            .set_keep_capabilities(true)
             .map_err(InitProcessError::SyscallOther)?;
     }
-
-    syscall
-        .set_keep_capabilities(true)
-        .map_err(InitProcessError::SyscallOther)?;
     syscall
         .set_gid(Gid::from_raw(process.user().gid()))
         .map_err(InitProcessError::SyscallOther)?;
@@ -514,36 +512,38 @@ fn set_process_security(process: &Process, syscall: &dyn Syscall) -> Result<()> 
         .set_uid(Uid::from_raw(process.user().uid()))
         .map_err(InitProcessError::SyscallOther)?;
 
-    let empty = CapsHashSet::new();
-    let effective = capability_sets
-        .effective()
-        .as_ref()
-        .map(capabilities::to_set)
-        .unwrap_or_default();
-    let permitted = capability_sets
-        .permitted()
-        .as_ref()
-        .map(capabilities::to_set)
-        .unwrap_or_default();
-    let inheritable = capability_sets
-        .inheritable()
-        .as_ref()
-        .map(capabilities::to_set)
-        .unwrap_or_default();
-    syscall
-        .set_process_capabilities(&effective, &permitted, &inheritable)
-        .map_err(InitProcessError::SyscallOther)?;
+    if let Some(capability_sets) = process.capabilities() {
+        let empty = CapsHashSet::new();
+        let effective = capability_sets
+            .effective()
+            .as_ref()
+            .map(capabilities::to_set)
+            .unwrap_or_default();
+        let permitted = capability_sets
+            .permitted()
+            .as_ref()
+            .map(capabilities::to_set)
+            .unwrap_or_default();
+        let inheritable = capability_sets
+            .inheritable()
+            .as_ref()
+            .map(capabilities::to_set)
+            .unwrap_or_default();
+        syscall
+            .set_process_capabilities(&effective, &permitted, &inheritable)
+            .map_err(InitProcessError::SyscallOther)?;
 
-    let ambient = capability_sets
-        .ambient()
-        .as_ref()
-        .map(capabilities::to_set)
-        .unwrap_or(empty);
-    syscall
-        .set_capability(CapSet::Ambient, &ambient)
-        .map_err(InitProcessError::SyscallOther)?;
+        let ambient = capability_sets
+            .ambient()
+            .as_ref()
+            .map(capabilities::to_set)
+            .unwrap_or(empty);
+        syscall
+            .set_capability(CapSet::Ambient, &ambient)
+            .map_err(InitProcessError::SyscallOther)?;
+    }
 
-    if process.no_new_privileges().is_some() {
+    if process.no_new_privileges().unwrap_or(false) {
         syscall
             .set_no_new_privileges()
             .map_err(InitProcessError::SyscallOther)?;
@@ -1254,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn process_security_is_ignored_without_capabilities() -> Result<()> {
+    fn process_credentials_are_applied_without_capabilities() -> Result<()> {
         let mut process = ProcessBuilder::default()
             .user(
                 UserBuilder::default()
@@ -1270,7 +1270,14 @@ mod tests {
 
         set_process_security(&process, &syscall)?;
 
-        assert!(syscall.get_security_calls().is_empty());
+        assert_eq!(
+            syscall.get_security_calls(),
+            vec![
+                SecurityCall::SetGid(Gid::from_raw(1002)),
+                SecurityCall::SetGroups(vec![Gid::from_raw(1003)]),
+                SecurityCall::SetUid(Uid::from_raw(1001)),
+            ]
+        );
         Ok(())
     }
 
@@ -1298,7 +1305,7 @@ mod tests {
                     .ambient(ambient.clone())
                     .build()?,
             )
-            .no_new_privileges(false)
+            .no_new_privileges(true)
             .build()?;
         let syscall = TestHelperSyscall::default();
 
