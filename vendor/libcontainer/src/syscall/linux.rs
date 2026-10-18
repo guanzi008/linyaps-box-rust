@@ -5,7 +5,7 @@ use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::io::{AsRawFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{mem, ptr};
@@ -766,6 +766,10 @@ impl Syscall for LinuxSyscall {
 
         if mount_fd_raw < 0 {
             let err = nix::errno::Errno::last();
+            if err == nix::errno::Errno::ENOSYS {
+                tracing::debug!(?target, "open_tree is unavailable; using legacy bind mount");
+                return legacy_mount_from_fd(source_fd, &parent_fd, name);
+            }
             tracing::error!(?err, "open_tree from fd failed");
             return Err(SyscallError::Nix(err));
         }
@@ -789,6 +793,13 @@ impl Syscall for LinuxSyscall {
 
         if res < 0 {
             let err = nix::errno::Errno::last();
+            if err == nix::errno::Errno::ENOSYS {
+                tracing::debug!(
+                    ?target,
+                    "move_mount is unavailable; using legacy bind mount"
+                );
+                return legacy_mount_from_fd(source_fd, &parent_fd, name);
+            }
             tracing::error!(?target, ?err, "move_mount failed");
             return Err(SyscallError::Nix(err));
         }
@@ -1098,6 +1109,27 @@ impl Syscall for LinuxSyscall {
             .map(|_| ())
             .map_err(|e| e.into())
     }
+}
+
+fn legacy_mount_from_fd(source_fd: &OwnedFd, parent_fd: &OwnedFd, name: &OsStr) -> Result<()> {
+    let target_fd = unsafe {
+        OwnedFd::from_raw_fd(fcntl::openat(
+            Some(parent_fd.as_raw_fd()),
+            name,
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )?)
+    };
+    let source = PathBuf::from(format!("/proc/self/fd/{}", source_fd.as_raw_fd()));
+    let target = PathBuf::from(format!("/proc/self/fd/{}", target_fd.as_raw_fd()));
+    mount(
+        Some(source.as_path()),
+        target.as_path(),
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

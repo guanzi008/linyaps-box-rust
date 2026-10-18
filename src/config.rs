@@ -1704,7 +1704,6 @@ fn strip_upstream_noop_process_fields(process: &mut serde_json::Map<String, Valu
     {
         process.remove("consoleSize");
     }
-    normalize_upstream_process_boole(process);
     normalize_process_capabilities(process);
     process.remove("scheduler");
     process.remove("apparmorProfile");
@@ -1745,14 +1744,6 @@ fn normalize_process_capabilities(process: &mut serde_json::Map<String, Value>) 
             .map(Value::String)
             .collect();
         *values = Value::Array(normalized);
-    }
-}
-
-fn normalize_upstream_process_boole(process: &mut serde_json::Map<String, Value>) {
-    for field in ["terminal", "noNewPrivileges"] {
-        if matches!(process.get(field), Some(Value::Bool(_))) {
-            process.insert(field.to_string(), Value::Bool(true));
-        }
     }
 }
 
@@ -2527,7 +2518,8 @@ pub fn process_uses_terminal(path: &Path) -> Result<bool> {
     let process = value.get("process").unwrap_or(&value);
     Ok(process
         .get("terminal")
-        .is_some_and(|value| !value.is_null()))
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
 }
 
 pub fn process_console_size(path: &Path) -> Result<Option<(u16, u16)>> {
@@ -2605,7 +2597,7 @@ mod tests {
         assert!(process_uses_terminal(temporary.path()).unwrap());
 
         fs::write(temporary.path(), br#"{"terminal":false}"#).unwrap();
-        assert!(process_uses_terminal(temporary.path()).unwrap());
+        assert!(!process_uses_terminal(temporary.path()).unwrap());
 
         fs::write(temporary.path(), br#"{}"#).unwrap();
         assert!(!process_uses_terminal(temporary.path()).unwrap());
@@ -3042,8 +3034,8 @@ mod tests {
 
         assert_eq!(value["hostname"], "ignored-host");
         assert_eq!(value["domainname"], "ignored-domain");
-        assert_eq!(value["process"]["terminal"], true);
-        assert_eq!(value["process"]["noNewPrivileges"], true);
+        assert_eq!(value["process"]["terminal"], false);
+        assert_eq!(value["process"]["noNewPrivileges"], false);
         assert_eq!(
             value["process"]["user"],
             serde_json::json!({"uid": 0, "gid": 0})

@@ -203,10 +203,6 @@ fn parse_errors_match_frozen_cli11_text() {
             "kill: The following argument was not expected: --bad",
         ),
         (
-            &["kill", "demo", "65"],
-            "SIGNAL: SIGNAL: signal number out of range: 65",
-        ),
-        (
             &["--root", "/a", "--root", "/b", "list"],
             "--root: At most 1 required but received 2",
         ),
@@ -226,6 +222,17 @@ fn parse_errors_match_frozen_cli11_text() {
                 "{expected}\nRun with --help for more information.\n"
             ));
     }
+
+    let signal = (libc::SIGRTMAX() + 1).to_string();
+    Command::cargo_bin("ll-box")
+        .unwrap()
+        .args(["kill", "demo", signal.as_str()])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(format!(
+            "SIGNAL: SIGNAL: signal number out of range: {signal}\nRun with --help for more information.\n"
+        ));
 }
 
 #[test]

@@ -295,6 +295,16 @@ fn compatibility_error_stage(error: &InitProcessError) -> u8 {
 }
 
 fn compatibility_error_message(error: &InitProcessError) -> String {
+    if matches!(error, InitProcessError::Tty(_)) {
+        let mut message = error.to_string();
+        let mut current = error.source();
+        while let Some(cause) = current {
+            message.push_str(": ");
+            message.push_str(&cause.to_string());
+            current = cause.source();
+        }
+        return message;
+    }
     if matches!(error, InitProcessError::RootFS(_)) {
         let mut current = error.source();
         while let Some(cause) = current {
@@ -471,6 +481,16 @@ mod tests {
     use procfs::process::Process;
 
     use super::*;
+
+    #[test]
+    fn reports_tty_error_chain() {
+        let error = InitProcessError::Tty(crate::tty::TTYError::CreatePseudoTerminal {
+            source: nix::errno::Errno::ENOSYS,
+        });
+        let message = compatibility_error_message(&error);
+        assert!(message.starts_with("failed to setup tty: could not create pseudo terminal: "));
+        assert!(message.contains("ENOSYS"));
+    }
 
     #[test]
     fn detects_whether_container_root_is_mapped() -> Result<()> {
