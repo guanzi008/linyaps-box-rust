@@ -38,5 +38,16 @@ dpkg-buildpackage --build=binary --no-sign
 `.changes` 和 `.buildinfo`。版本、架构、共享库依赖、调试符号拆分及校验和
 均由 Debian 工具链管理；发布新版本时应先更新 `debian/changelog`。
 
+## Fedora RPM
+
+`packaging/fedora/linyaps-box-rust.spec` 提供 x86_64 RPM 打包规则，构建
+`linyaps-box-rust` 包。与主项目同级检出时，执行
+`bash ../linyaps-rust/packaging/fedora/build.sh 44`，可在 Fedora 容器内
+同时构建两个项目及配套源码 RPM。准备阶段会下载锁定的 Cargo 依赖；
+源码 RPM 包含依赖，编译和测试阶段无需联网。
+
+这是第三方未签名测试包，并非 Fedora 官方软件包；安装检查不等于
+SELinux、Wayland 或 NVIDIA 真机验证。
+
 项目代码许可证为 `LGPL-3.0-or-later`；vendored Youki `libcontainer` 保持其
 `Apache-2.0` 许可证，完整文本与冻结上游 REUSE 许可证集合均位于 `LICENSES/`。
